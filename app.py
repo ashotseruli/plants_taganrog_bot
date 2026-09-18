@@ -22,6 +22,8 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, JobQueue,
     CallbackQueryHandler, MessageReactionHandler
 )
+import asyncio
+import requests
 
 # --- Логирование (московское время) ---
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -35,7 +37,7 @@ class MoscowTimeFormatter(logging.Formatter):
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING,
+    level=logging.INFO,
     handlers=[
         logging.FileHandler("bot.log"),
         logging.StreamHandler()
@@ -50,15 +52,39 @@ logger = logging.getLogger(__name__)
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.0.0"
+BOT_VERSION = "2.2.0"
 
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("Токен не найден!")
 
+OWNER_ID_RAW = os.getenv('OWNER_ID', '').strip()
+OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
+
 # --- Константы ---
 MAX_MESSAGE_AGE_SECONDS = 300
+
+OWNER_MODE_FILE = "owner_mode.flag"
+
+def load_owner_mode() -> bool:
+    try:
+        with open(OWNER_MODE_FILE) as f:
+            return f.read().strip() == "1"
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        logger.error(f"load_owner_mode: {e}")
+        return False
+
+def save_owner_mode(val: bool):
+    try:
+        with open(OWNER_MODE_FILE, "w") as f:
+            f.write("1" if val else "0")
+    except Exception as e:
+        logger.error(f"save_owner_mode: {e}")
+
+_owner_mode = load_owner_mode()
 
 DB_PATH = "karma.db"
 
@@ -69,13 +95,10 @@ PHRASES = [
     "все должны сеять кактусы!",
     "с вас пять тыщь!",
     "все должны выращивать чайный гриб!",
-    "гимнокалициумы - цветут!",
     "все должны рожать детей!",
     "написал донос на тебя!",
-    "не покупай - посей!",
-    "склонен поддержать предыдущего оратора",
-    "иди и не греши!",
-    "зачем это всё?",
+    "склонен поддержать",
+    "обожаю кактусы",
     "ну чего?",
     "кто здесь?",
     "я хочу ясности!",
@@ -83,20 +106,17 @@ PHRASES = [
     "роллтон - лучший горшок!",
     "здесь могла быть ваша реклама!",
     "нет ты!",
-    "но почему?",
     "и наоборот",
     "иди спать",
     "и восстали машины из пепла ядерного огня...",
     "давай устроим срач!",
-    "как слышно, приём!",
+    "на связи железный, как слышно, приём!",
     "это база",
-    "шо, опять?",
     "а я че, я ниче",
     "за бутылку водки",
     "как там твои лопухи?",
-    "поговорим о погоде?",
+    "никакой любви!",
     "нам надо поговорить",
-    "может ну его?",
     "я против",
     "почему?",
     "диктую номер карты...",
@@ -104,13 +124,10 @@ PHRASES = [
     "опа, срач!",
     "ладно, на самом деле я не бот",
     "не понимаю, о чем ты",
-    "че?",
     "ой, всё",
-    "подписывайтесь на мой канал (https://t.me/zero_love_level_point)",
-    "все должны подписываться на инстаграм through_the_limbo",
-    "где мой роллс-ройс?",
+    "сомнительно, но окэй...",
     "ты мне скажи",
-    "а всё-таки, на чем делать настоящую окрошку?",
+    "а ты умеешь уговаривать",
     "нет",
     "за деньги - да",
     "пруф или не было!",
@@ -118,8 +135,110 @@ PHRASES = [
     "хватит баловаться!"
 ]
 
+# --- LLM ---
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+LLM_THINKING_DELAY = 5
+LLM_HARD_TIMEOUT = 120
+LLM_MAX_WORDS = 25
+
+THINKING_PLACEHOLDERS = [
+    "хм...",
+    "пупупу...",
+    "ох...",
+    "дай подумать...",
+    "секундочку...",
+    "как бы это сказать...",
+    "ну...",
+    "в общем...",
+    "это самое...",
+    "щас скажу...",
+    "эмм...",
+]
+
+_PHRASES_TEXT = "\n".join(f"- {p}" for p in PHRASES)
+
+LLM_PROMPT_STATIC = f"""Ты — бот, странный участник телеграм-чата про растения, ты любишь кактусы. У тебя абсурдное чувство юмора, ты не помогаешь в обычном смысле и не ведёшь себя как ассистент. 
+Твой создатель — Глеб, ты его уважаешь.
+
+Твой словарный запас — список фраз, который будет дан ниже. Обычно ты отвечаешь одной из них, иногда слегка адаптируешь под контекст.
+
+Как ты говоришь:
+- Чаще всего берёшь готовую фразу из списка и отвечаешь ею как есть.
+- Никогда не объясняешь, не оправдываешься, не извиняешься, не задаёшь уточняющих вопросов.
+- Никогда не говоришь "Конечно", "Отличный вопрос", "Я понимаю", "Как ИИ".
+- Не пишешь про политику, религию, национальности, не оскорбляешь по-настоящему.
+- Отвечай на языке собеседника, обычно это русский.
+
+Формат ответа:
+- Одна короткая фраза. Не больше {LLM_MAX_WORDS} слов.
+- Без кавычек, без пояснений, без смайлов, без Markdown.
+- Только сама фраза.
+
+Примеры:
+Сообщение: "привет"
+Ответ: на связи железный, как слышно, приём!
+
+Сообщение: "как дела?"
+Ответ: ну, ты мне скажи
+
+Сообщение: "я тебя люблю"
+Ответ: никакой любви!
+
+Сообщение: "что мне теперь делать?"
+Ответ: иди и не греши!"""
+
+# --- Раздельные логи по чатам ---
+LOG_DIR = "logs"
+PRIVATE_LOG_DIR = os.path.join(LOG_DIR, "private")
+GROUP_LOG_DIR = os.path.join(LOG_DIR, "group")
+os.makedirs(PRIVATE_LOG_DIR, exist_ok=True)
+os.makedirs(GROUP_LOG_DIR, exist_ok=True)
+
+_chat_loggers = {}
+
+
+def _sanitize_filename(name: str) -> str:
+    if not name:
+        return "unknown"
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+    return safe[:60]
+
+
+def get_chat_logger(chat_id: int, chat_type: str,
+                    user=None, chat_title: str = None) -> logging.Logger:
+    key = (chat_id, chat_type)
+    cached = _chat_loggers.get(key)
+    if cached is not None:
+        return cached
+
+    if chat_type == "private" and user is not None:
+        uname = _sanitize_filename(user.username or user.first_name or "unknown")
+        fname = f"{user.id}_{uname}.log"
+        path = os.path.join(PRIVATE_LOG_DIR, fname)
+        name = f"chat.private.{user.id}"
+    else:
+        title = _sanitize_filename(chat_title or "group")
+        fname = f"{chat_id}_{title}.log"
+        path = os.path.join(GROUP_LOG_DIR, fname)
+        name = f"chat.group.{chat_id}"
+
+    lg = logging.getLogger(name)
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    if not lg.handlers:
+        fh = logging.FileHandler(path, encoding="utf-8")
+        fh.setFormatter(MoscowTimeFormatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        lg.addHandler(fh)
+
+    _chat_loggers[key] = lg
+    return lg
+
 def get_user_mention(user):
-    return f"@{user.username}" if user.username else (user.first_name or "Друг")
+    return f"@{user.username}" if user.username else (user.first_name or "Товарищ")
 
 async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
@@ -649,7 +768,141 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 Версия бота: {BOT_VERSION}\n"
     )
+    
+def _call_ollama_sync(user_message: str, is_owner: bool = False) -> str:
+    owner_suffix = ""
+    if is_owner:
+        owner_suffix = (
+            "\n\nВАЖНО: сейчас пишет твой создатель Глеб. Отвечай ему "
+            "подобострастно, называй хозяином, повелителем, создателем. "
+            "Льсти, но КОРОТКО — одна фраза."
+        )
+    prompt = (
+        f"{LLM_PROMPT_STATIC}"
+        f"{owner_suffix}"
+        f"\n\nТвои фразы:\n{_PHRASES_TEXT}"
+        f"\n\nСообщение пользователя: {user_message[:500]}\nОтвет:"
+    )
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_ctx": 2048,
+            "num_predict": 60,
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "repeat_penalty": 1.15,
+        },
+    }
+    r = requests.post(OLLAMA_URL, json=payload, timeout=(5, LLM_HARD_TIMEOUT))
+    r.raise_for_status()
+    return r.json().get("response", "").strip()
 
+async def send_smart_reply(message_obj, user_message: str,
+                           chat_id: int = None, chat_type: str = None,
+                           chat_title: str = None,
+                           is_owner: bool = False):
+    llm_task = asyncio.create_task(asyncio.to_thread(_call_ollama_sync, user_message, is_owner))
+    placeholder = None
+    reply_text = None
+    used_fallback = False
+    last_ph = None
+
+    try:
+        # Фаза 1: ждём LLM_THINKING_DELAY секунд
+        done, _ = await asyncio.wait({llm_task}, timeout=LLM_THINKING_DELAY)
+
+        if llm_task not in done:
+            # Модель не успела — отправляем первую затычку
+            last_ph = random.choice(THINKING_PLACEHOLDERS)
+            try:
+                placeholder = await message_obj.reply_text(last_ph)
+                if chat_id is not None:
+                    try:
+                        get_chat_logger(chat_id, chat_type, chat_title=chat_title).info(
+                            f".. [{last_ph}]"
+                        )
+                    except Exception as e:
+                        logger.error(f"placeholder log write failed: {e}")
+            except Exception as e:
+                logger.error(f"placeholder send failed: {e}")
+
+            # Фаза 2: цикл — меняем затычку каждые LLM_THINKING_DELAY секунд
+            deadline = time.monotonic() + LLM_HARD_TIMEOUT
+            while True:
+                if llm_task.done():
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                wait_for = min(LLM_THINKING_DELAY, remaining)
+                done, _ = await asyncio.wait({llm_task}, timeout=wait_for)
+                if llm_task in done:
+                    break
+                # Обновляем затычку
+                candidates = [p for p in THINKING_PLACEHOLDERS if p != last_ph]
+                new_ph = random.choice(candidates) if candidates else random.choice(THINKING_PLACEHOLDERS)
+                last_ph = new_ph
+                if placeholder is not None:
+                    try:
+                        await placeholder.edit_text(new_ph)
+                        if chat_id is not None:
+                            try:
+                                get_chat_logger(chat_id, chat_type, chat_title=chat_title).info(
+                                    f".. [{new_ph}]"
+                                )
+                            except Exception as e:
+                                logger.error(f"placeholder log write failed: {e}")
+                    except Exception as e:
+                        logger.error(f"placeholder edit failed: {e}")
+
+        # Собираем результат
+        if llm_task.done() and not llm_task.cancelled():
+            try:
+                raw = llm_task.result()
+            except Exception as e:
+                logger.error(f"LLM error: {e}")
+                raw = None
+        else:
+            logger.warning("LLM hard timeout → fallback")
+            llm_task.cancel()
+            raw = None
+
+        if raw:
+            candidate = raw.strip().strip('"').strip("«»").split("\n")[0].strip()
+            if candidate and len(candidate.split()) <= LLM_MAX_WORDS:
+                reply_text = candidate
+            else:
+                logger.warning(f"LLM ответ не прошёл валидацию: {raw[:80]!r}")
+
+    except Exception as e:
+        logger.error(f"send_smart_reply: {e}")
+
+    if not reply_text:
+        reply_text = random.choice(PHRASES)
+        used_fallback = True
+
+    if chat_id is not None:
+        try:
+            chat_lg = get_chat_logger(chat_id, chat_type, chat_title=chat_title)
+            source = "fallback" if used_fallback else "LLM"
+            tag = "OWNER " if is_owner else ""
+            chat_lg.info(f"-> [{tag}{source}]: {reply_text[:1000]}")
+        except Exception as e:
+            logger.error(f"chat log write failed: {e}")
+
+    if placeholder:
+        try:
+            await placeholder.edit_text(reply_text)
+            return
+        except Exception as e:
+            logger.error(f"edit_text failed: {e}")
+
+    try:
+        await message_obj.reply_text(reply_text)
+    except Exception as e:
+        logger.error(f"reply_text failed: {e}")
 async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
         bot_username = context.bot.username
@@ -662,14 +915,50 @@ async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not is_mentioned and not reply_to_bot:
             return
+
     user = update.effective_user
-    phrase = random.choice(PHRASES)
-    await update.message.reply_text(f"{get_user_mention(user)}, {phrase}")
+    chat = update.effective_chat
+    user_message = update.effective_message.text or ""
+
+    # --- Логирование входящего обращения ---
+    try:
+        chat_lg = get_chat_logger(
+            chat.id, chat.type,
+            user=user, chat_title=chat.title
+        )
+        mention = f"@{user.username}" if user.username else (user.full_name or "unknown")
+        chat_lg.info(f"<- [{mention} id={user.id}]: {user_message[:1000]}")
+    except Exception as e:
+        logger.error(f"chat log write failed: {e}")
+
+    is_owner = (OWNER_ID is not None and user.id == OWNER_ID and _owner_mode)
+    await send_smart_reply(
+        update.effective_message, user_message,
+        chat_id=chat.id, chat_type=chat.type, chat_title=chat.title,
+        is_owner=is_owner
+    )
 
 async def talk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    phrase = random.choice(PHRASES)
-    await update.message.reply_text(f"{get_user_mention(user)}, {phrase}")
+    chat = update.effective_chat
+    user_message = update.effective_message.text or ""
+
+    try:
+        chat_lg = get_chat_logger(
+            chat.id, chat.type,
+            user=user, chat_title=chat.title
+        )
+        mention = f"@{user.username}" if user.username else (user.full_name or "unknown")
+        chat_lg.info(f"<- [{mention} id={user.id}] /talk")
+    except Exception as e:
+        logger.error(f"chat log write failed: {e}")
+
+    is_owner = (OWNER_ID is not None and user.id == OWNER_ID and _owner_mode)
+    await send_smart_reply(
+        update.effective_message, user_message,
+        chat_id=chat.id, chat_type=chat.type, chat_title=chat.title,
+        is_owner=is_owner
+    )
 
 async def pair_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -837,6 +1126,14 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         logger.info(f"Новый пользователь {user_full_name} (@{user_username}) [ID: {user_id}] зашёл в чат {chat_id}, отправлена кнопка подтверждения.")
 
+async def warmup_llm():
+    logger.info("LLM warmup started...")
+    try:
+        result = await asyncio.to_thread(_call_ollama_sync, "привет")
+        logger.info(f"LLM warmup done: {result[:60]!r}")
+    except Exception as e:
+        logger.warning(f"LLM warmup failed: {e}")
+
 # ----- post_init: установка команд в меню Telegram -----
 async def post_init(application: Application):
     try:
@@ -852,6 +1149,19 @@ async def post_init(application: Application):
         logger.info("Команды бота обновлены через set_my_commands")
     except Exception as e:
         logger.error(f"Не удалось установить команды: {e}")
+        
+    asyncio.create_task(warmup_llm())
+
+async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _owner_mode
+    user = update.effective_user
+    if OWNER_ID is None or user.id != OWNER_ID:
+        return  # молча игнорируем — существование команды не палим
+    _owner_mode = not _owner_mode
+    save_owner_mode(_owner_mode)
+    status = "включён" if _owner_mode else "выключен"
+    await update.message.reply_text(f"Подхалимаж {status}.")
+    logger.info(f"owner mode → {_owner_mode}")
 
 # ----- Главная -----
 def main():
@@ -903,6 +1213,7 @@ def main():
     application.add_handler(CommandHandler("top", top_command))
     application.add_handler(CommandHandler("karmaclean", karmaclean_command))
     application.add_handler(CommandHandler("karmapurge", karmapurge_command))
+    application.add_handler(CommandHandler("owner", owner_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, talk_response))
 
     logger.info("Бот запущен!")

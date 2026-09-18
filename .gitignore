@@ -21,3 +21,5 @@ karma.db
 # IDE
 .idea/
 .vscode/
+owner_mode.flag
+logs/
