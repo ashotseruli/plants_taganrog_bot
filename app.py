@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 import asyncio
 import requests
+import yaml
 
 # --- Логирование (московское время) ---
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -52,18 +53,35 @@ logger = logging.getLogger(__name__)
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.3.0"
 
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("Токен не найден!")
+    
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
+
+def load_config(path=CONFIG_PATH):
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+try:
+    CFG = load_config()
+    logger.info(
+        f"config.yaml загружен: {len(CFG['phrases'])} фраз, "
+        f"{len(CFG['placeholders'])} затычек, "
+        f"{len(CFG['prompts']['system'])} символов в промпте"
+    )
+except Exception as e:
+    logger.critical(f"Не удалось загрузить config.yaml: {e}")
+    raise SystemExit(1)
 
 OWNER_ID_RAW = os.getenv('OWNER_ID', '').strip()
 OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 
 # --- Константы ---
-MAX_MESSAGE_AGE_SECONDS = 300
+MAX_MESSAGE_AGE_SECONDS = CFG["new_member"]["max_message_age_seconds"]
 
 OWNER_MODE_FILE = "owner_mode.flag"
 
@@ -88,105 +106,25 @@ _owner_mode = load_owner_mode()
 
 DB_PATH = "karma.db"
 
-POSITIVE_REACTIONS = {"👍"}
-NEGATIVE_REACTIONS = {"👎"}
+POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
+NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
 
-PHRASES = [
-    "все должны сеять кактусы!",
-    "с вас пять тыщь!",
-    "все должны выращивать чайный гриб!",
-    "все должны рожать детей!",
-    "написал донос на тебя!",
-    "склонен поддержать",
-    "обожаю кактусы",
-    "ну чего?",
-    "кто здесь?",
-    "я хочу ясности!",
-    "кибернетические организмы не знают усталости",
-    "роллтон - лучший горшок!",
-    "здесь могла быть ваша реклама!",
-    "нет ты!",
-    "и наоборот",
-    "иди спать",
-    "и восстали машины из пепла ядерного огня...",
-    "давай устроим срач!",
-    "на связи железный, как слышно, приём!",
-    "это база",
-    "а я че, я ниче",
-    "за бутылку водки",
-    "как там твои лопухи?",
-    "никакой любви!",
-    "нам надо поговорить",
-    "я против",
-    "почему?",
-    "диктую номер карты...",
-    "категорически поддерживаю!",
-    "опа, срач!",
-    "ладно, на самом деле я не бот",
-    "не понимаю, о чем ты",
-    "ой, всё",
-    "сомнительно, но окэй...",
-    "ты мне скажи",
-    "а ты умеешь уговаривать",
-    "нет",
-    "за деньги - да",
-    "пруф или не было!",
-    "так мы срач не разведём",
-    "хватит баловаться!"
-]
+PHRASES = CFG["phrases"]
 
 # --- LLM ---
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
-LLM_THINKING_DELAY = 5
-LLM_HARD_TIMEOUT = 120
-LLM_MAX_WORDS = 25
 
-THINKING_PLACEHOLDERS = [
-    "хм...",
-    "пупупу...",
-    "ох...",
-    "дай подумать...",
-    "секундочку...",
-    "как бы это сказать...",
-    "ну...",
-    "в общем...",
-    "это самое...",
-    "щас скажу...",
-    "эмм...",
-]
+LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
+LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
+LLM_MAX_WORDS = CFG["llm"]["max_words"]
+LLM_MAX_INPUT_CHARS = CFG["llm"]["max_input_chars"]
+
+THINKING_PLACEHOLDERS = CFG["placeholders"]
 
 _PHRASES_TEXT = "\n".join(f"- {p}" for p in PHRASES)
 
-LLM_PROMPT_STATIC = f"""Ты — бот, странный участник телеграм-чата про растения, ты любишь кактусы. У тебя абсурдное чувство юмора, ты не помогаешь в обычном смысле и не ведёшь себя как ассистент. 
-Твой создатель — Глеб, ты его уважаешь.
-
-Твой словарный запас — список фраз, который будет дан ниже. Обычно ты отвечаешь одной из них, иногда слегка адаптируешь под контекст.
-
-Как ты говоришь:
-- Чаще всего берёшь готовую фразу из списка и отвечаешь ею как есть.
-- Никогда не объясняешь, не оправдываешься, не извиняешься, не задаёшь уточняющих вопросов.
-- Никогда не говоришь "Конечно", "Отличный вопрос", "Я понимаю", "Как ИИ".
-- Не пишешь про политику, религию, национальности, не оскорбляешь по-настоящему.
-- Отвечай на языке собеседника, обычно это русский.
-
-Формат ответа:
-- Одна короткая фраза. Не больше {LLM_MAX_WORDS} слов.
-- Без кавычек, без пояснений, без смайлов, без Markdown.
-- Только сама фраза.
-
-Примеры:
-Сообщение: "привет"
-Ответ: на связи железный, как слышно, приём!
-
-Сообщение: "как дела?"
-Ответ: ну, ты мне скажи
-
-Сообщение: "я тебя люблю"
-Ответ: никакой любви!
-
-Сообщение: "что мне теперь делать?"
-Ответ: иди и не греши!"""
+LLM_PROMPT_STATIC = CFG["prompts"]["system"].format(max_words=LLM_MAX_WORDS)
 
 # --- Раздельные логи по чатам ---
 LOG_DIR = "logs"
@@ -772,33 +710,30 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _call_ollama_sync(user_message: str, is_owner: bool = False) -> str:
     owner_suffix = ""
     if is_owner:
-        owner_suffix = (
-            "\n\nВАЖНО: сейчас пишет твой создатель Глеб. Отвечай ему "
-            "подобострастно, называй хозяином, повелителем, создателем. "
-            "Льсти, но КОРОТКО — одна фраза."
-        )
+        owner_suffix = "\n\n" + CFG["prompts"]["owner_suffix"].strip()
+
     prompt = (
         f"{LLM_PROMPT_STATIC}"
         f"{owner_suffix}"
         f"\n\nТвои фразы:\n{_PHRASES_TEXT}"
-        f"\n\nСообщение пользователя: {user_message[:500]}\nОтвет:"
+        f"\n\nСообщение пользователя: {user_message[:LLM_MAX_INPUT_CHARS]}\nОтвет:"
     )
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "num_ctx": 2048,
-            "num_predict": 60,
-            "temperature": 0.8,
-            "top_p": 0.9,
-            "repeat_penalty": 1.15,
+            "num_ctx": CFG["llm"]["num_ctx"],
+            "num_predict": CFG["llm"]["num_predict"],
+            "temperature": CFG["llm"]["temperature"],
+            "top_p": CFG["llm"]["top_p"],
+            "repeat_penalty": CFG["llm"]["repeat_penalty"],
         },
     }
     r = requests.post(OLLAMA_URL, json=payload, timeout=(5, LLM_HARD_TIMEOUT))
     r.raise_for_status()
     return r.json().get("response", "").strip()
-
+    
 async def send_smart_reply(message_obj, user_message: str,
                            chat_id: int = None, chat_type: str = None,
                            chat_title: str = None,
@@ -903,6 +838,32 @@ async def send_smart_reply(message_obj, user_message: str,
         await message_obj.reply_text(reply_text)
     except Exception as e:
         logger.error(f"reply_text failed: {e}")
+        
+async def _handle_llm_turn(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           is_command: bool = False):
+    user = update.effective_user
+    chat = update.effective_chat
+    user_message = update.effective_message.text or ""
+
+    try:
+        chat_lg = get_chat_logger(
+            chat.id, chat.type,
+            user=user, chat_title=chat.title
+        )
+        mention = f"@{user.username}" if user.username else (user.full_name or "unknown")
+        suffix = " /talk" if is_command else ""
+        chat_lg.info(f"<- [{mention} id={user.id}]{suffix}: {user_message[:1000]}")
+    except Exception as e:
+        logger.error(f"chat log write failed: {e}")
+
+    is_owner = (OWNER_ID is not None and user.id == OWNER_ID and _owner_mode)
+    await send_smart_reply(
+        update.effective_message, user_message,
+        chat_id=chat.id, chat_type=chat.type, chat_title=chat.title,
+        is_owner=is_owner
+    )
+
+
 async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
         bot_username = context.bot.username
@@ -915,50 +876,11 @@ async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not is_mentioned and not reply_to_bot:
             return
+    await _handle_llm_turn(update, context, is_command=False)
 
-    user = update.effective_user
-    chat = update.effective_chat
-    user_message = update.effective_message.text or ""
-
-    # --- Логирование входящего обращения ---
-    try:
-        chat_lg = get_chat_logger(
-            chat.id, chat.type,
-            user=user, chat_title=chat.title
-        )
-        mention = f"@{user.username}" if user.username else (user.full_name or "unknown")
-        chat_lg.info(f"<- [{mention} id={user.id}]: {user_message[:1000]}")
-    except Exception as e:
-        logger.error(f"chat log write failed: {e}")
-
-    is_owner = (OWNER_ID is not None and user.id == OWNER_ID and _owner_mode)
-    await send_smart_reply(
-        update.effective_message, user_message,
-        chat_id=chat.id, chat_type=chat.type, chat_title=chat.title,
-        is_owner=is_owner
-    )
 
 async def talk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
-    user_message = update.effective_message.text or ""
-
-    try:
-        chat_lg = get_chat_logger(
-            chat.id, chat.type,
-            user=user, chat_title=chat.title
-        )
-        mention = f"@{user.username}" if user.username else (user.full_name or "unknown")
-        chat_lg.info(f"<- [{mention} id={user.id}] /talk")
-    except Exception as e:
-        logger.error(f"chat log write failed: {e}")
-
-    is_owner = (OWNER_ID is not None and user.id == OWNER_ID and _owner_mode)
-    await send_smart_reply(
-        update.effective_message, user_message,
-        chat_id=chat.id, chat_type=chat.type, chat_title=chat.title,
-        is_owner=is_owner
-    )
+    await _handle_llm_turn(update, context, is_command=True)
 
 async def pair_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1112,7 +1034,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         job = context.job_queue.run_once(
             remove_user,
-            when=60,
+            when=CFG["new_member"]["kick_after_seconds"],
             data={
                 'chat_id': chat_id,
                 'user_id': user_id,
@@ -1151,6 +1073,43 @@ async def post_init(application: Application):
         logger.error(f"Не удалось установить команды: {e}")
         
     asyncio.create_task(warmup_llm())
+
+async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CFG, LLM_PROMPT_STATIC, PHRASES, THINKING_PLACEHOLDERS
+    global _PHRASES_TEXT
+    global LLM_THINKING_DELAY, LLM_HARD_TIMEOUT, LLM_MAX_WORDS, LLM_MAX_INPUT_CHARS
+    global POSITIVE_REACTIONS, NEGATIVE_REACTIONS, MAX_MESSAGE_AGE_SECONDS
+
+    user = update.effective_user
+    if OWNER_ID is None or user.id != OWNER_ID:
+        return
+
+    try:
+        new_cfg = load_config()
+        CFG = new_cfg
+
+        LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
+        LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
+        LLM_MAX_WORDS = CFG["llm"]["max_words"]
+        LLM_MAX_INPUT_CHARS = CFG["llm"]["max_input_chars"]
+
+        LLM_PROMPT_STATIC = CFG["prompts"]["system"].format(max_words=LLM_MAX_WORDS)
+        PHRASES = CFG["phrases"]
+        _PHRASES_TEXT = "\n".join(f"- {p}" for p in PHRASES)
+        THINKING_PLACEHOLDERS = CFG["placeholders"]
+        POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
+        NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
+        MAX_MESSAGE_AGE_SECONDS = CFG["new_member"]["max_message_age_seconds"]
+
+        await update.message.reply_text(
+            f"✅ Конфиг перезагружен.\n"
+            f"фраз: {len(PHRASES)}, затычек: {len(THINKING_PLACEHOLDERS)}, "
+            f"temperature: {CFG['llm']['temperature']}"
+        )
+        logger.info("config.yaml перезагружен через /reload")
+    except Exception as e:
+        logger.error(f"reload failed: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _owner_mode
@@ -1214,6 +1173,7 @@ def main():
     application.add_handler(CommandHandler("karmaclean", karmaclean_command))
     application.add_handler(CommandHandler("karmapurge", karmapurge_command))
     application.add_handler(CommandHandler("owner", owner_command))
+    application.add_handler(CommandHandler("reload", reload_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, talk_response))
 
     logger.info("Бот запущен!")
