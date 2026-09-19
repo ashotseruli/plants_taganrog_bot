@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.3.0"
+BOT_VERSION = "2.4.0"
 
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
@@ -104,6 +104,45 @@ def save_owner_mode(val: bool):
 
 _owner_mode = load_owner_mode()
 
+# --- История диалогов (thread-based) ---
+_chat_histories = {}       # (chat_id, thread_id) -> list[{"role","content"}]
+_msg_to_thread = {}        # (chat_id, message_id) -> thread_id
+
+def _resolve_thread_key(chat, msg):
+    if chat.type == "private":
+        return chat.id
+    reply = getattr(msg, "reply_to_message", None)
+    if reply is not None:
+        parent_thread = _msg_to_thread.get((chat.id, reply.message_id))
+        if parent_thread is not None:
+            return parent_thread
+    return msg.message_id
+
+def _remember_message(chat_id, message_id, thread_id):
+    _msg_to_thread[(chat_id, message_id)] = thread_id
+
+def _get_history(chat_id, thread_id):
+    key = (chat_id, thread_id)
+    if key not in _chat_histories:
+        _chat_histories[key] = []
+    return _chat_histories[key]
+
+def _trim_history(hist, max_msgs, max_chars):
+    if len(hist) > max_msgs:
+        hist = hist[-max_msgs:]
+    total = 0
+    result = []
+    for item in reversed(hist):
+        c = len(item.get("content", ""))
+        if total + c > max_chars:
+            break
+        total += c
+        result.append(item)
+    return list(reversed(result))
+
+def _clear_thread(chat_id, thread_id):
+    _chat_histories.pop((chat_id, thread_id), None)
+
 DB_PATH = "karma.db"
 
 POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
@@ -112,8 +151,9 @@ NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
 PHRASES = CFG["phrases"]
 
 # --- LLM ---
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+logger.info(f"LLM: model={OLLAMA_MODEL}, url={OLLAMA_URL}")
 
 LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
 LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
@@ -691,7 +731,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"{get_user_mention(user)}, я умею:\n"
-        "/talk – случайная фраза\n"
+        "/talk – болтать обо всём\n"
         "/pair – случайные пары из слов\n"
         "/karma – показать СВОЮ карму\n"
         "/karma @username – карма указанного пользователя\n"
@@ -707,20 +747,26 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 Версия бота: {BOT_VERSION}\n"
     )
     
-def _call_ollama_sync(user_message: str, is_owner: bool = False) -> str:
-    owner_suffix = ""
+def _call_ollama_sync(user_message, is_owner=False, chat_id=None, thread_id=None):
+    system_content = LLM_PROMPT_STATIC
     if is_owner:
-        owner_suffix = "\n\n" + CFG["prompts"]["owner_suffix"].strip()
+        system_content += "\n\n" + CFG["prompts"]["owner_suffix"].strip()
 
-    prompt = (
-        f"{LLM_PROMPT_STATIC}"
-        f"{owner_suffix}"
-        f"\n\nТвои фразы:\n{_PHRASES_TEXT}"
-        f"\n\nСообщение пользователя: {user_message[:LLM_MAX_INPUT_CHARS]}\nОтвет:"
-    )
+    messages = [{"role": "system", "content": system_content}]
+
+    if chat_id is not None and thread_id is not None:
+        hist = _trim_history(
+            _get_history(chat_id, thread_id),
+            CFG["llm"]["history_max_messages"],
+            CFG["llm"]["history_max_chars"],
+        )
+        messages.extend(hist)
+
+    messages.append({"role": "user", "content": user_message[:LLM_MAX_INPUT_CHARS]})
+
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
+        "messages": messages,
         "stream": False,
         "options": {
             "num_ctx": CFG["llm"]["num_ctx"],
@@ -732,13 +778,16 @@ def _call_ollama_sync(user_message: str, is_owner: bool = False) -> str:
     }
     r = requests.post(OLLAMA_URL, json=payload, timeout=(5, LLM_HARD_TIMEOUT))
     r.raise_for_status()
-    return r.json().get("response", "").strip()
+    return (r.json().get("message") or {}).get("content", "").strip()
     
 async def send_smart_reply(message_obj, user_message: str,
                            chat_id: int = None, chat_type: str = None,
                            chat_title: str = None,
+                           thread_id: int = None,
                            is_owner: bool = False):
-    llm_task = asyncio.create_task(asyncio.to_thread(_call_ollama_sync, user_message, is_owner))
+    llm_task = asyncio.create_task(
+        asyncio.to_thread(_call_ollama_sync, user_message, is_owner, chat_id, thread_id)
+    )
     placeholder = None
     reply_text = None
     used_fallback = False
@@ -827,29 +876,44 @@ async def send_smart_reply(message_obj, user_message: str,
         except Exception as e:
             logger.error(f"chat log write failed: {e}")
 
+    # --- Сохраняем ход в историю thread ---
+    if chat_id is not None and thread_id is not None and user_message.strip():
+        hist = _get_history(chat_id, thread_id)
+        hist.append({"role": "user", "content": user_message[:LLM_MAX_INPUT_CHARS]})
+        hist.append({"role": "assistant", "content": reply_text})
+        _chat_histories[(chat_id, thread_id)] = _trim_history(
+            hist,
+            CFG["llm"]["history_max_messages"],
+            CFG["llm"]["history_max_chars"],
+        )
+
+    sent_msg = None
     if placeholder:
         try:
-            await placeholder.edit_text(reply_text)
-            return
+            sent_msg = await placeholder.edit_text(reply_text)
         except Exception as e:
             logger.error(f"edit_text failed: {e}")
 
-    try:
-        await message_obj.reply_text(reply_text)
-    except Exception as e:
-        logger.error(f"reply_text failed: {e}")
+    if sent_msg is None:
+        try:
+            sent_msg = await message_obj.reply_text(reply_text)
+        except Exception as e:
+            logger.error(f"reply_text failed: {e}")
+
+    if sent_msg is not None and chat_id is not None and thread_id is not None:
+        _remember_message(chat_id, sent_msg.message_id, thread_id) 
         
-async def _handle_llm_turn(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                           is_command: bool = False):
+async def _handle_llm_turn(update, context, is_command=False):
     user = update.effective_user
     chat = update.effective_chat
-    user_message = update.effective_message.text or ""
+    msg = update.effective_message
+    user_message = msg.text or ""
+
+    thread_id = _resolve_thread_key(chat, msg)
+    _remember_message(chat.id, msg.message_id, thread_id)
 
     try:
-        chat_lg = get_chat_logger(
-            chat.id, chat.type,
-            user=user, chat_title=chat.title
-        )
+        chat_lg = get_chat_logger(chat.id, chat.type, user=user, chat_title=chat.title)
         mention = f"@{user.username}" if user.username else (user.full_name or "unknown")
         suffix = " /talk" if is_command else ""
         chat_lg.info(f"<- [{mention} id={user.id}]{suffix}: {user_message[:1000]}")
@@ -858,9 +922,10 @@ async def _handle_llm_turn(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     is_owner = (OWNER_ID is not None and user.id == OWNER_ID and _owner_mode)
     await send_smart_reply(
-        update.effective_message, user_message,
+        msg, user_message,
         chat_id=chat.id, chat_type=chat.type, chat_title=chat.title,
-        is_owner=is_owner
+        thread_id=thread_id,
+        is_owner=is_owner,
     )
 
 
@@ -1085,6 +1150,8 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        global _chat_histories
+        _chat_histories = {}
         new_cfg = load_config()
         CFG = new_cfg
 
@@ -1121,6 +1188,19 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "включён" if _owner_mode else "выключен"
     await update.message.reply_text(f"Подхалимаж {status}.")
     logger.info(f"owner mode → {_owner_mode}")
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+
+    if OWNER_ID is None or user.id != OWNER_ID:
+        return
+
+    thread_id = _resolve_thread_key(chat, msg)
+    _clear_thread(chat.id, thread_id)
+    await msg.reply_text("🧹 История этой ветки очищена.")
+    logger.info(f"thread cleared: chat={chat.id} thread={thread_id}")
 
 # ----- Главная -----
 def main():
@@ -1174,6 +1254,7 @@ def main():
     application.add_handler(CommandHandler("karmapurge", karmapurge_command))
     application.add_handler(CommandHandler("owner", owner_command))
     application.add_handler(CommandHandler("reload", reload_command))
+    application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, talk_response))
 
     logger.info("Бот запущен!")
