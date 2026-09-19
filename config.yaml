@@ -15,6 +15,7 @@ llm:
   repeat_penalty: 1.1
   history_max_messages: 6     # сколько последних сообщений (user+assistant) хранить
   history_max_chars: 1500     # и жёсткий лимит по символам (~500 токенов)
+  user_cooldown: 1.0 
 
 prompts:
   system: |

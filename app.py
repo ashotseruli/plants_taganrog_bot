@@ -104,6 +104,22 @@ def save_owner_mode(val: bool):
 
 _owner_mode = load_owner_mode()
 
+# --- Дедупликация апдейтов ---
+_seen_messages = {}          # chat_id -> set of message_ids
+_SEEN_LIMIT = 200            # держим последние 200 id на чат
+
+def _is_duplicate(chat_id: int, message_id: int) -> bool:
+    seen = _seen_messages.setdefault(chat_id, set())
+    if message_id in seen:
+        return True
+    seen.add(message_id)
+    # ограничиваем размер — удаляем старые
+    if len(seen) > _SEEN_LIMIT:
+        # оставляем только последние _SEEN_LIMIT
+        # (множество не упорядочено — просто чистим раз в N добавлений)
+        _seen_messages[chat_id] = set(list(seen)[-_SEEN_LIMIT:])
+    return False
+
 # --- История диалогов (thread-based) ---
 _chat_histories = {}       # (chat_id, thread_id) -> list[{"role","content"}]
 _msg_to_thread = {}        # (chat_id, message_id) -> thread_id
@@ -908,7 +924,11 @@ async def _handle_llm_turn(update, context, is_command=False):
     chat = update.effective_chat
     msg = update.effective_message
     user_message = msg.text or ""
-
+    
+    if _is_duplicate(chat.id, msg.message_id):
+        logger.info(f"skip duplicate: chat={chat.id} msg_id={msg.message_id}")
+        return
+        
     thread_id = _resolve_thread_key(chat, msg)
     _remember_message(chat.id, msg.message_id, thread_id)
 
@@ -1258,7 +1278,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, talk_response))
 
     logger.info("Бот запущен!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
