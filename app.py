@@ -37,6 +37,15 @@ from telegram.ext import (
 import httpx
 import yaml
 
+from utils import (
+    sanitize_filename,
+    is_mentioned,
+    placeholders,
+    safe_format,
+    msg_edit_ts,
+    trim_history,
+)
+
 # --- Пути (не зависим от CWD) ---
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = str(BASE_DIR / "karma.db")
@@ -110,7 +119,7 @@ def _spawn(coro) -> asyncio.Task:
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.5.7"
+BOT_VERSION = "2.5.8"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -192,21 +201,6 @@ def _validate_config(cfg: dict) -> None:
         raise ValueError("config.yaml: 'new_member.kick_after_seconds' должен быть > 0")
 
 
-def _safe_format(template: str, **kwargs) -> str:
-    """Подставляет {name}-плейсхолдеры; если в шаблоне есть посторонние фигурные
-    скобки (JSON-примеры и т.п.) — логирует и заменяет только известные ключи."""
-    try:
-        return template.format(**kwargs)
-    except (KeyError, IndexError, ValueError) as e:
-        logger.warning(
-            "_safe_format: .format() не сработал (%s), использую fallback-замену", e
-        )
-        result = template
-        for k, v in kwargs.items():
-            result = result.replace("{" + k + "}", str(v))
-        return result
-
-
 try:
     CFG = load_config()
     _validate_config(CFG)
@@ -253,17 +247,6 @@ def _is_duplicate(chat_id: int, message_id: int, edit_date_ts: int = 0) -> bool:
     if len(_seen_messages) > _SEEN_LIMIT:
         _seen_messages.popitem(last=False)
     return False
-
-
-def _msg_edit_ts(msg) -> int:
-    """edit_date сообщения в unix-времени или 0, если сообщение не редактировалось."""
-    ed = getattr(msg, "edit_date", None)
-    if ed is None:
-        return 0
-    try:
-        return int(ed.timestamp())
-    except Exception:
-        return 0
 
 
 # --- История диалогов (thread-based, LRU) ---
@@ -354,20 +337,6 @@ def _get_history(chat_id, thread_id):
     return _chat_histories[key]
 
 
-def _trim_history(hist, max_msgs, max_chars):
-    if len(hist) > max_msgs:
-        hist = hist[-max_msgs:]
-    total = 0
-    result = []
-    for item in reversed(hist):
-        c = len(item.get("content", ""))
-        if total + c > max_chars:
-            break
-        total += c
-        result.append(item)
-    return list(reversed(result))
-
-
 def _clear_thread(chat_id, thread_id):
     """Убирает историю, связанные записи в маппинге и lock для треда."""
     _chat_histories.pop((chat_id, thread_id), None)
@@ -395,7 +364,7 @@ LLM_MAX_INPUT_CHARS = CFG["llm"]["max_input_chars"]
 
 THINKING_PLACEHOLDERS = CFG["placeholders"]
 
-LLM_PROMPT_STATIC = _safe_format(CFG["prompts"]["system"], max_words=LLM_MAX_WORDS)
+LLM_PROMPT_STATIC = safe_format(CFG["prompts"]["system"], max_words=LLM_MAX_WORDS)
 
 # --- Общий httpx-клиент (переиспользуем соединения) ---
 _http_client: "httpx.AsyncClient | None" = None
@@ -430,13 +399,6 @@ _chat_loggers = OrderedDict()
 _CHAT_LOGGERS_LIMIT = 200
 
 
-def _sanitize_filename(name: str) -> str:
-    if not name:
-        return "unknown"
-    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
-    return safe[:60]
-
-
 def get_chat_logger(chat_id: int, chat_type: str,
                     user=None, chat_title: str = None) -> logging.Logger:
     key = (chat_id, chat_type)
@@ -449,14 +411,14 @@ def get_chat_logger(chat_id: int, chat_type: str,
         # В привате chat_id == user.id, поэтому ключуемся по chat_id —
         # так имя файла не зависит от того, передали ли user.
         if user is not None:
-            uname = _sanitize_filename(user.username or user.first_name or "unknown")
+            uname = sanitize_filename(user.username or user.first_name or "unknown")
         else:
             uname = "unknown"
         fname = f"{chat_id}_{uname}.log"
         name = f"chat.private.{chat_id}"
         path = os.path.join(str(PRIVATE_LOG_DIR), fname)
     else:
-        title = _sanitize_filename(chat_title or "group")
+        title = sanitize_filename(chat_title or "group")
         fname = f"{chat_id}_{title}.log"
         path = os.path.join(str(GROUP_LOG_DIR), fname)
         name = f"chat.group.{chat_id}"
@@ -491,13 +453,6 @@ def get_chat_logger(chat_id: int, chat_type: str,
 
 def get_user_mention(user):
     return f"@{user.username}" if user.username else (user.first_name or "Товарищ")
-
-
-def _is_mentioned(text: str, bot_username: "str | None") -> bool:
-    """Регистронезависимая проверка @mention в тексте."""
-    if not bot_username or not text:
-        return False
-    return f"@{bot_username.lower()}" in text.lower()
 
 
 async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -681,23 +636,14 @@ def db_delete_reactions_older_than(days: int):
         conn.close()
 
 
-def _placeholders(seq) -> str:
-    """Возвращает список '?' для SQL IN (...). Если seq пуст — литерал NULL,
-    чтобы 'IN (NULL)' был синтаксически валиден и всегда false (не полагаемся
-    на специфику SQLite с пустым IN ())."""
-    if not seq:
-        return "NULL"
-    return ",".join("?" * len(seq))
-
-
 def db_get_karma(user_id: int, since: int = 0) -> int:
     pos = list(POSITIVE_REACTIONS)
     neg = list(NEGATIVE_REACTIONS)
     query = f"""
         SELECT COALESCE(SUM(
             CASE
-                WHEN r.reaction IN ({_placeholders(pos)}) THEN 1
-                WHEN r.reaction IN ({_placeholders(neg)}) THEN -1
+                WHEN r.reaction IN ({placeholders(pos)}) THEN 1
+                WHEN r.reaction IN ({placeholders(neg)}) THEN -1
                 ELSE 0
             END
         ), 0)
@@ -730,8 +676,8 @@ def db_get_rank(user_id: int, since: int = 0, karma_user: int = None) -> int:
         SELECT COUNT(*) + 1 FROM (
             SELECT m.user_id AS uid, SUM(
                 CASE
-                    WHEN r.reaction IN ({_placeholders(pos)}) THEN 1
-                    WHEN r.reaction IN ({_placeholders(neg)}) THEN -1
+                    WHEN r.reaction IN ({placeholders(pos)}) THEN 1
+                    WHEN r.reaction IN ({placeholders(neg)}) THEN -1
                     ELSE 0
                 END
             ) AS karma
@@ -763,8 +709,8 @@ def db_get_top(limit: int = 5, since: int = 0):
                u.first_name,
                SUM(
                    CASE
-                       WHEN r.reaction IN ({_placeholders(pos)}) THEN 1
-                       WHEN r.reaction IN ({_placeholders(neg)}) THEN -1
+                       WHEN r.reaction IN ({placeholders(pos)}) THEN 1
+                       WHEN r.reaction IN ({placeholders(neg)}) THEN -1
                        ELSE 0
                    END
                ) AS karma
@@ -1155,7 +1101,7 @@ async def _call_ollama_async(
     messages = [{"role": "system", "content": system_content}]
 
     if chat_id is not None and thread_id is not None:
-        hist = _trim_history(
+        hist = trim_history(
             _get_history(chat_id, thread_id),
             CFG["llm"]["history_max_messages"],
             CFG["llm"]["history_max_chars"],
@@ -1290,7 +1236,7 @@ async def send_smart_reply(message_obj, user_message: str,
         hist = _get_history(chat_id, thread_id)
         hist.append({"role": "user", "content": user_message[:LLM_MAX_INPUT_CHARS]})
         hist.append({"role": "assistant", "content": reply_text})
-        _chat_histories[(chat_id, thread_id)] = _trim_history(
+        _chat_histories[(chat_id, thread_id)] = trim_history(
             hist,
             CFG["llm"]["history_max_messages"],
             CFG["llm"]["history_max_chars"],
@@ -1322,7 +1268,7 @@ async def _handle_llm_turn(update, context, edit_ts=None):
     user_message = msg.text or msg.caption or ""
 
     if edit_ts is None:
-        edit_ts = _msg_edit_ts(msg)
+        edit_ts = msg_edit_ts(msg)
     if _is_duplicate(chat.id, msg.message_id, edit_ts):
         logger.info("skip duplicate: chat=%s msg_id=%s edit=%s",
                     chat.id, msg.message_id, edit_ts)
@@ -1381,23 +1327,23 @@ async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = msg.text or msg.caption or ""
     bot_username = context.bot.username
-    is_mentioned = _is_mentioned(text, bot_username)
+    mentioned = is_mentioned(text, bot_username)
     reply_to_bot = (
         msg.reply_to_message
         and msg.reply_to_message.from_user
         and msg.reply_to_message.from_user.id == context.bot.id
     )
 
-    edit_ts = _msg_edit_ts(msg)
+    edit_ts = msg_edit_ts(msg)
 
     if update.effective_chat.type != 'private':
-        if not is_mentioned and not reply_to_bot:
+        if not mentioned and not reply_to_bot:
             return
     elif edit_ts != 0:
         # В привате обычные сообщения идут к LLM без условий. Но edit —
         # это правка опечатки или случайный триггер; реагируем только если
         # пользователь явно упомянул бота или ответил на его сообщение.
-        if not is_mentioned and not reply_to_bot:
+        if not mentioned and not reply_to_bot:
             return
 
     await _handle_llm_turn(update, context, edit_ts=edit_ts)
@@ -1700,7 +1646,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.getenv("LLM_USER_COOLDOWN", CFG["llm"].get("user_cooldown", 2.0))
         )
 
-        LLM_PROMPT_STATIC = _safe_format(CFG["prompts"]["system"], max_words=LLM_MAX_WORDS)
+        LLM_PROMPT_STATIC = safe_format(CFG["prompts"]["system"], max_words=LLM_MAX_WORDS)
         PHRASES = CFG["phrases"]
         THINKING_PLACEHOLDERS = CFG["placeholders"]
         POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
