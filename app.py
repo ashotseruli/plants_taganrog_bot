@@ -43,7 +43,11 @@ DB_PATH = str(BASE_DIR / "karma.db")
 LOG_DIR = BASE_DIR / "logs"
 PRIVATE_LOG_DIR = LOG_DIR / "private"
 GROUP_LOG_DIR = LOG_DIR / "group"
-BOT_LOG_FILE = BASE_DIR / "bot.log"
+BOT_LOG_FILE = LOG_DIR / "system.log"
+
+# Создаём папку логов заранее — иначе RotatingFileHandler ниже упадёт
+# на системах, где logs/ ещё нет.
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Логирование (московское время) ---
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -106,7 +110,7 @@ def _spawn(coro) -> asyncio.Task:
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.5.6"
+BOT_VERSION = "2.5.7"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -419,8 +423,8 @@ async def _close_http_client():
 
 
 # --- Раздельные логи по чатам (LRU) ---
-os.makedirs(PRIVATE_LOG_DIR, exist_ok=True)
-os.makedirs(GROUP_LOG_DIR, exist_ok=True)
+PRIVATE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+GROUP_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _chat_loggers = OrderedDict()
 _CHAT_LOGGERS_LIMIT = 200
@@ -442,7 +446,7 @@ def get_chat_logger(chat_id: int, chat_type: str,
         return cached
 
     if chat_type == "private":
-        # В приватке chat_id == user.id, поэтому ключуемся по chat_id —
+        # В привате chat_id == user.id, поэтому ключуемся по chat_id —
         # так имя файла не зависит от того, передали ли user.
         if user is not None:
             uname = _sanitize_filename(user.username or user.first_name or "unknown")
@@ -1390,7 +1394,7 @@ async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_mentioned and not reply_to_bot:
             return
     elif edit_ts != 0:
-        # В приватке обычные сообщения идут к LLM без условий. Но edit —
+        # В привате обычные сообщения идут к LLM без условий. Но edit —
         # это правка опечатки или случайный триггер; реагируем только если
         # пользователь явно упомянул бота или ответил на его сообщение.
         if not is_mentioned and not reply_to_bot:
