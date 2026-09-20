@@ -36,6 +36,7 @@ from telegram.ext import (
 import httpx
 import db
 import config
+import threads
 
 from utils import (
     sanitize_filename,
@@ -156,123 +157,6 @@ def _kick_human() -> str:
     return f"{sec // 60} мин" if sec >= 60 else f"{sec} сек"
 
 
-# --- Дедупликация апдейтов (LRU через OrderedDict) ---
-# Ключ: (chat_id, message_id, edit_date_ts). Для обычных сообщений edit_date=0.
-# Редактирование меняет edit_date и, соответственно, ключ — edit с новым
-# упоминанием бота проходит дедуп, а повторный апдейт того же edit'а — нет.
-_seen_messages = OrderedDict()
-_SEEN_LIMIT = 5000
-
-
-def _is_duplicate(chat_id: int, message_id: int, edit_date_ts: int = 0) -> bool:
-    key = (chat_id, message_id, edit_date_ts)
-    if key in _seen_messages:
-        _seen_messages.move_to_end(key)
-        return True
-    _seen_messages[key] = None
-    if len(_seen_messages) > _SEEN_LIMIT:
-        _seen_messages.popitem(last=False)
-    return False
-
-
-# --- История диалогов (thread-based, LRU) ---
-_chat_histories = OrderedDict()     # (chat_id, thread_id) -> list[{"role","content"}]
-_CHAT_HISTORIES_LIMIT = 500
-_msg_to_thread = OrderedDict()      # (chat_id, message_id) -> thread_id
-_MSG_TO_THREAD_LIMIT = 5000
-
-# Локи per-thread: сериализуют LLM-ответы внутри одного треда, чтобы порядок
-# сообщений/ответов в истории не путался при concurrent_updates.
-# Это осознанный трейд-офф: сообщения одного пользователя в одном треде
-# обрабатываются строго последовательно (второе сообщение подождёт первого),
-# зато user/assistant-пары в истории всегда лежат в правильном порядке.
-_history_locks: "OrderedDict[tuple[int, int], asyncio.Lock]" = OrderedDict()
-_HISTORY_LOCKS_LIMIT = 2000
-
-
-def _get_thread_lock(chat_id: int, thread_id: int) -> asyncio.Lock:
-    """Возвращает (создаёт при необходимости) asyncio.Lock для пары (chat, thread).
-    При переполнении вытесняются только свободные локи — захваченные не трогаем,
-    чтобы не отобрать лок у работающей корутины. В редком случае, когда все
-    локи заняты, словарь может временно превысить лимит — это допустимо."""
-    key = (chat_id, thread_id)
-    lock = _history_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _history_locks[key] = lock
-        if len(_history_locks) > _HISTORY_LOCKS_LIMIT:
-            evicted = False
-            for k in list(_history_locks.keys()):
-                if k == key:
-                    continue
-                if not _history_locks[k].locked():
-                    _history_locks.pop(k, None)
-                    evicted = True
-                    break
-            if not evicted:
-                # Все локи заняты — вытеснять некого. Словарь временно превысит
-                # лимит; логируем, чтобы заметить аномалию (например, залипший лок).
-                logger.warning(
-                    "_get_thread_lock: все %d локов заняты, словарь растёт "
-                    "(chat=%s thread=%s)",
-                    _HISTORY_LOCKS_LIMIT, chat_id, thread_id,
-                )
-    else:
-        _history_locks.move_to_end(key)
-    return lock
-
-
-def _drop_thread_mappings(chat_id: int, thread_id: int) -> None:
-    """Убирает все записи message→thread для указанного треда."""
-    stale = [
-        k for k, v in _msg_to_thread.items()
-        if k[0] == chat_id and v == thread_id
-    ]
-    for k in stale:
-        _msg_to_thread.pop(k, None)
-
-
-def _resolve_thread_key(chat, msg):
-    if chat.type == "private":
-        return chat.id
-    reply = getattr(msg, "reply_to_message", None)
-    if reply is not None:
-        parent_thread = _msg_to_thread.get((chat.id, reply.message_id))
-        if parent_thread is not None:
-            return parent_thread
-    return msg.message_id
-
-
-def _remember_message(chat_id, message_id, thread_id):
-    key = (chat_id, message_id)
-    _msg_to_thread[key] = thread_id
-    _msg_to_thread.move_to_end(key)
-    if len(_msg_to_thread) > _MSG_TO_THREAD_LIMIT:
-        _msg_to_thread.popitem(last=False)
-
-
-def _get_history(chat_id, thread_id):
-    key = (chat_id, thread_id)
-    if key not in _chat_histories:
-        _chat_histories[key] = []
-        if len(_chat_histories) > _CHAT_HISTORIES_LIMIT:
-            old_chat, old_thread = _chat_histories.popitem(last=False)[0]
-            _drop_thread_mappings(old_chat, old_thread)
-    else:
-        _chat_histories.move_to_end(key)
-    return _chat_histories[key]
-
-
-def _clear_thread(chat_id, thread_id):
-    """Убирает историю, связанные записи в маппинге и lock для треда."""
-    _chat_histories.pop((chat_id, thread_id), None)
-    _drop_thread_mappings(chat_id, thread_id)
-    # Lock снимаем, только если он свободен.
-    lock = _history_locks.get((chat_id, thread_id))
-    if lock is not None and not lock.locked():
-        _history_locks.pop((chat_id, thread_id), None)
-
-
 db.POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
 db.NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
 
@@ -379,6 +263,38 @@ def get_chat_logger(chat_id: int, chat_type: str,
 
 def get_user_mention(user):
     return f"@{user.username}" if user.username else (user.first_name or "Товарищ")
+
+def extract_emojis(reactions) -> set:
+    """Из списка ReactionType возвращает set строк-идентификаторов реакций.
+
+    Кастомные эмодзи маркируются префиксом 'custom:<id>'.
+    В POSITIVE_REACTIONS / NEGATIVE_REACTIONS такие строки не задаются —
+    кастомные реакции по умолчанию игнорируются. Если нужно учитывать —
+    добавьте их id в конфиг в формате 'custom:<id>'."""
+    result = set()
+    if not reactions:
+        return result
+    for r in reactions:
+        emoji = getattr(r, "emoji", None)
+        if emoji:
+            result.add(emoji)
+            continue
+        custom_id = getattr(r, "custom_emoji_id", None)
+        if custom_id:
+            result.add(f"custom:{custom_id}")
+    return result
+
+
+def _entity_text(msg, ent) -> str:
+    """Безопасно достаёт текст сущности, учитывая UTF-16 offset (Telegram API)."""
+    text = msg.text or msg.caption or ""
+    try:
+        encoded = text.encode("utf-16-le")
+        start = ent.offset * 2
+        end = (ent.offset + ent.length) * 2
+        return encoded[start:end].decode("utf-16-le")
+    except Exception:
+        return text[ent.offset:ent.offset + ent.length]
 
 
 async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -697,7 +613,7 @@ async def _call_ollama_async(
 
     if chat_id is not None and thread_id is not None:
         hist = trim_history(
-            _get_history(chat_id, thread_id),
+            threads.get_history(chat_id, thread_id),
             CFG["llm"]["history_max_messages"],
             CFG["llm"]["history_max_chars"],
         )
@@ -828,10 +744,10 @@ async def send_smart_reply(message_obj, user_message: str,
     # попадать в контекст, иначе они загрязняют промпт и портят следующие ответы.
     if (chat_id is not None and thread_id is not None
             and user_message.strip() and not used_fallback):
-        hist = _get_history(chat_id, thread_id)
+        hist = threads.get_history(chat_id, thread_id)
         hist.append({"role": "user", "content": user_message[:LLM_MAX_INPUT_CHARS]})
         hist.append({"role": "assistant", "content": reply_text})
-        _chat_histories[(chat_id, thread_id)] = trim_history(
+        hist[:] = trim_history(
             hist,
             CFG["llm"]["history_max_messages"],
             CFG["llm"]["history_max_chars"],
@@ -851,7 +767,7 @@ async def send_smart_reply(message_obj, user_message: str,
             logger.error(f"reply_text failed: {e}")
 
     if sent_msg is not None and chat_id is not None and thread_id is not None:
-        _remember_message(chat_id, sent_msg.message_id, thread_id)
+        threads.remember_message(chat_id, sent_msg.message_id, thread_id)
 
 
 async def _handle_llm_turn(update, context, edit_ts=None):
@@ -864,7 +780,7 @@ async def _handle_llm_turn(update, context, edit_ts=None):
 
     if edit_ts is None:
         edit_ts = msg_edit_ts(msg)
-    if _is_duplicate(chat.id, msg.message_id, edit_ts):
+    if threads.is_duplicate(chat.id, msg.message_id, edit_ts):
         logger.info("skip duplicate: chat=%s msg_id=%s edit=%s",
                     chat.id, msg.message_id, edit_ts)
         return
@@ -884,8 +800,8 @@ async def _handle_llm_turn(update, context, edit_ts=None):
         cutoff = now - 60.0
         _llm_last_call = {k: v for k, v in _llm_last_call.items() if v > cutoff}
 
-    thread_id = _resolve_thread_key(chat, msg)
-    _remember_message(chat.id, msg.message_id, thread_id)
+    thread_id = threads.resolve_thread_key(chat, msg)
+    threads.remember_message(chat.id, msg.message_id, thread_id)
 
     try:
         chat_lg = get_chat_logger(chat.id, chat.type, user=user, chat_title=chat.title)
@@ -898,7 +814,7 @@ async def _handle_llm_turn(update, context, edit_ts=None):
     # сообщение, следующее в том же треде подождёт. Это гарантирует корректный
     # порядок пар user/assistant в истории при concurrent_updates.
     # Трейд-офф: сообщения одного юзера в одном треде обрабатываются подряд.
-    lock = _get_thread_lock(chat.id, thread_id)
+    lock = threads.get_thread_lock(chat.id, thread_id)
 
     async def _do_turn():
         async with lock:
@@ -1085,7 +1001,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Дубли апдейта о новом участнике плодят вторую кнопку/джоб — режем.
     # Дедуп ставим после валидации, чтобы не «съесть» потенциально валидный
     # повтор, если в первый раз бот не имел прав.
-    if _is_duplicate(chat_id, update.message.message_id, 0):
+    if threads.is_duplicate(chat_id, update.message.message_id, 0):
         logger.info(
             "skip duplicate new_member: chat=%s msg_id=%s",
             chat_id, update.message.message_id,
@@ -1191,7 +1107,7 @@ async def post_shutdown(application: Application):
             t.cancel()
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
-    _history_locks.clear()
+    threads.clear_all_locks()
     await _close_http_client()
 
 
@@ -1213,7 +1129,6 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LLM_THINKING_DELAY, LLM_HARD_TIMEOUT, LLM_MAX_WORDS, LLM_MAX_INPUT_CHARS
     global MAX_MESSAGE_AGE_SECONDS
     global LLM_USER_COOLDOWN
-    global _chat_histories
 
     user = update.effective_user
     if OWNER_ID is None or user.id != OWNER_ID:
@@ -1224,14 +1139,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         config.validate_config(new_cfg)
         CFG = new_cfg
 
-        # Сбрасываем и истории, и маппинг message→thread — они связаны,
-        # держать одну без другой неаккуратно.
-        _chat_histories = OrderedDict()
-        _msg_to_thread.clear()
-        # Свободные локи тоже не нужны — они были привязаны к старым историям.
-        for k in list(_history_locks.keys()):
-            if not _history_locks[k].locked():
-                _history_locks.pop(k, None)
+        threads.clear_all_histories()
 
         LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
         LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
@@ -1270,8 +1178,8 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat is None or msg is None:
         return
 
-    thread_id = _resolve_thread_key(chat, msg)
-    _clear_thread(chat.id, thread_id)
+    thread_id = threads.resolve_thread_key(chat, msg)
+    threads.clear_thread(chat.id, thread_id)
     await msg.reply_text("🧹 История этой ветки очищена.")
     logger.info(f"thread cleared: chat={chat.id} thread={thread_id}")
 
