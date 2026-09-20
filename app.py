@@ -33,11 +33,15 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler,
     CallbackQueryHandler, MessageReactionHandler
 )
-import httpx
+
+# Важно: .env должен быть загружен ДО импорта наших модулей,
+# потому что db.py / config.py / llm.py читают env на этапе import.
+load_dotenv()
+
 import db
 import config
 import threads
-
+import llm
 from utils import (
     sanitize_filename,
     is_mentioned,
@@ -118,12 +122,11 @@ def _spawn(coro) -> asyncio.Task:
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.5.8"
+BOT_VERSION = "2.6.4"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
 
-load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("Токен не найден!")
@@ -163,42 +166,17 @@ db.NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
 PHRASES = CFG["phrases"]
 
 # --- LLM ---
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
-logger.info("LLM: model=%s, url=%s", OLLAMA_MODEL, OLLAMA_URL)
+logger.info("LLM: model=%s, url=%s", llm.OLLAMA_MODEL, llm.OLLAMA_URL)
 
 LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
 LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
+llm.set_hard_timeout(LLM_HARD_TIMEOUT)
 LLM_MAX_WORDS = CFG["llm"]["max_words"]
 LLM_MAX_INPUT_CHARS = CFG["llm"]["max_input_chars"]
 
 THINKING_PLACEHOLDERS = CFG["placeholders"]
 
 LLM_PROMPT_STATIC = safe_format(CFG["prompts"]["system"], max_words=LLM_MAX_WORDS)
-
-# --- Общий httpx-клиент (переиспользуем соединения) ---
-_http_client: "httpx.AsyncClient | None" = None
-
-
-async def _get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=5.0, read=LLM_HARD_TIMEOUT, write=10.0, pool=5.0
-            )
-        )
-    return _http_client
-
-
-async def _close_http_client():
-    global _http_client
-    if _http_client is not None:
-        try:
-            await _http_client.aclose()
-        except Exception as e:
-            logger.warning(f"Не удалось закрыть httpx-клиент: {e}")
-        _http_client = None
 
 
 # --- Раздельные логи по чатам (LRU) ---
@@ -607,9 +585,7 @@ async def _call_ollama_async(
     chat_id: "int | None" = None,
     thread_id: "int | None" = None,
 ) -> str:
-    system_content = LLM_PROMPT_STATIC
-
-    messages = [{"role": "system", "content": system_content}]
+    messages = [{"role": "system", "content": LLM_PROMPT_STATIC}]
 
     if chat_id is not None and thread_id is not None:
         hist = trim_history(
@@ -621,24 +597,14 @@ async def _call_ollama_async(
 
     messages.append({"role": "user", "content": user_message[:LLM_MAX_INPUT_CHARS]})
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": False,
-        "options": {
-            "num_ctx": CFG["llm"]["num_ctx"],
-            "num_predict": CFG["llm"]["num_predict"],
-            "temperature": CFG["llm"]["temperature"],
-            "top_p": CFG["llm"]["top_p"],
-            "repeat_penalty": CFG["llm"]["repeat_penalty"],
-        },
+    options = {
+        "num_ctx": CFG["llm"]["num_ctx"],
+        "num_predict": CFG["llm"]["num_predict"],
+        "temperature": CFG["llm"]["temperature"],
+        "top_p": CFG["llm"]["top_p"],
+        "repeat_penalty": CFG["llm"]["repeat_penalty"],
     }
-    # Общий клиент — переиспользуем HTTP-соединения.
-    client = await _get_http_client()
-    r = await client.post(OLLAMA_URL, json=payload)
-    r.raise_for_status()
-    return (r.json().get("message") or {}).get("content", "").strip()
-
+    return await llm.post_chat(messages, options)
 
 async def send_smart_reply(message_obj, user_message: str,
                            chat_id: "int | None" = None,
@@ -1108,8 +1074,7 @@ async def post_shutdown(application: Application):
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
     threads.clear_all_locks()
-    await _close_http_client()
-
+    await llm.close_http_client()
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     update_id = getattr(update, "update_id", None)
@@ -1143,6 +1108,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
         LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
+        llm.set_hard_timeout(LLM_HARD_TIMEOUT)
         LLM_MAX_WORDS = CFG["llm"]["max_words"]
         LLM_MAX_INPUT_CHARS = CFG["llm"]["max_input_chars"]
         LLM_USER_COOLDOWN = float(

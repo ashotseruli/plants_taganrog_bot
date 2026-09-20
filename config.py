@@ -11,6 +11,9 @@ from pathlib import Path
 
 import yaml
 
+from dotenv import load_dotenv
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
