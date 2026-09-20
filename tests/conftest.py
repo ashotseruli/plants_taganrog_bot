@@ -57,14 +57,10 @@ _TEST_CFG = {
 
 @pytest.fixture
 def temp_db(monkeypatch, tmp_path):
-    """Изолированная БД для одного теста.
-
-    Подменяет app.DB_PATH на файл в tmp_path, создаёт схему.
-    Все db_* функции читают DB_PATH из модуля при каждом вызове,
-    поэтому monkeypatch действует до конца теста.
-    """
-    import app
-    db_path = tmp_path / "test_karma.db"
-    monkeypatch.setattr(app, "DB_PATH", str(db_path))
-    app.init_db()
-    return db_path
+    """Изолированная БД для одного теста."""
+    import db
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "test_karma.db"))
+    monkeypatch.setattr(db, "POSITIVE_REACTIONS", {"👍"})
+    monkeypatch.setattr(db, "NEGATIVE_REACTIONS", {"👎"})
+    db.init_db()
+    return db
