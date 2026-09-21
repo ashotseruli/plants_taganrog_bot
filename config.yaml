@@ -4,6 +4,7 @@
 # ==========================================================
 
 llm:
+  model: hf.co/MilyaShams/T-lite-it-1.0-Q4_K_M-GGUF:Q4_K_M
   thinking_delay: 5
   hard_timeout: 90
   max_words: 25

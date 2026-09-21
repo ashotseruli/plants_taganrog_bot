@@ -13,14 +13,22 @@ import httpx
 logger = logging.getLogger(__name__)
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+
+# Модель задаётся из app.py через set_model() — чтобы можно было менять
+# через /reload без рестарта службы.
+_model: str = ""
 
 DEFAULT_HARD_TIMEOUT = 90
 
 _http_client: "httpx.AsyncClient | None" = None
 _hard_timeout: float = DEFAULT_HARD_TIMEOUT
 
-
+def set_model(name: str) -> None:
+    """Устанавливает имя модели Ollama. Вызывается из app.py при старте
+    и в /reload."""
+    global _model
+    _model = name
+    
 def set_hard_timeout(seconds: float) -> None:
     """Устанавливает read-таймаут для запросов к Ollama.
 
@@ -59,7 +67,7 @@ async def post_chat(messages: list, options: dict) -> str:
     модель ответила без content.
     """
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": _model,
         "messages": messages,
         "stream": False,
         "options": options,
