@@ -64,6 +64,8 @@ def validate_config(cfg: dict) -> None:
     llm = cfg["llm"]
     if not isinstance(llm, dict):
         raise ValueError("config.yaml: 'llm' должен быть словарём")
+    if not isinstance(llm.get("model"), str) or not llm["model"].strip():
+        raise ValueError("config.yaml: 'llm.model' отсутствует, не строка или пуст")        
     num_keys = (
         "thinking_delay", "hard_timeout", "max_words", "max_input_chars",
         "history_max_messages", "history_max_chars",

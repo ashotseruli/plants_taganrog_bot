@@ -25,6 +25,7 @@ os.environ["CONFIG_PATH"] = str(_TMP / "config.yaml")
 # --- Минимальный валидный config.yaml ---
 _TEST_CFG = {
     "llm": {
+        "model": "test:model",
         "thinking_delay": 5,
         "hard_timeout": 90,
         "max_words": 25,

@@ -122,7 +122,7 @@ def _spawn(coro) -> asyncio.Task:
 # --- Хранилище ---
 pending_jobs = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.6.4"
+BOT_VERSION = "2.6.6"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -166,7 +166,8 @@ db.NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
 PHRASES = CFG["phrases"]
 
 # --- LLM ---
-logger.info("LLM: model=%s, url=%s", llm.OLLAMA_MODEL, llm.OLLAMA_URL)
+logger.info("LLM: model=%s, url=%s", CFG["llm"]["model"], llm.OLLAMA_URL)
+llm.set_model(CFG["llm"]["model"])
 
 LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
 LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
@@ -1109,6 +1110,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LLM_THINKING_DELAY = CFG["llm"]["thinking_delay"]
         LLM_HARD_TIMEOUT = CFG["llm"]["hard_timeout"]
         llm.set_hard_timeout(LLM_HARD_TIMEOUT)
+        llm.set_model(CFG["llm"]["model"])
         LLM_MAX_WORDS = CFG["llm"]["max_words"]
         LLM_MAX_INPUT_CHARS = CFG["llm"]["max_input_chars"]
         LLM_USER_COOLDOWN = float(

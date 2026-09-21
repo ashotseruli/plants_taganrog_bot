@@ -14,6 +14,7 @@ def _base_cfg():
     """Минимальный валидный конфиг, от которого удобно отталкиваться."""
     return {
         "llm": {
+            "model": "test:model",
             "thinking_delay": 5,
             "hard_timeout": 90,
             "max_words": 25,
@@ -147,6 +148,24 @@ class TestLlm:
         cfg["llm"]["user_cooldown"] = "fast"
         with pytest.raises(ValueError, match="user_cooldown"):
             config.validate_config(cfg)
+            
+    def test_missing_model(self):
+        cfg = _base_cfg()
+        del cfg["llm"]["model"]
+        with pytest.raises(ValueError, match="model"):
+            config.validate_config(cfg)
+
+    def test_empty_model(self):
+        cfg = _base_cfg()
+        cfg["llm"]["model"] = "   "
+        with pytest.raises(ValueError, match="model"):
+            config.validate_config(cfg)
+
+    def test_not_str_model(self):
+        cfg = _base_cfg()
+        cfg["llm"]["model"] = 42
+        with pytest.raises(ValueError, match="model"):
+            config.validate_config(cfg)            
 
 
 class TestNewMember:
