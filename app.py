@@ -121,8 +121,9 @@ def _spawn(coro) -> asyncio.Task:
 
 # --- Хранилище ---
 pending_jobs = {}
+pending_verify = {}   # (chat_id, user_id) -> правильная кнопка (1..3)
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.6.6"
+BOT_VERSION = "2.7.1"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -159,6 +160,27 @@ def _kick_human() -> str:
     sec = CFG["new_member"]["kick_after_seconds"]
     return f"{sec // 60} мин" if sec >= 60 else f"{sec} сек"
 
+VERIFY_BUTTONS = 3
+
+
+def _verify_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с тремя кнопками 1|2|3."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(n), callback_data=f"verify:{n}")
+        for n in range(1, VERIFY_BUTTONS + 1)
+    ]])
+
+
+def _verify_text(mention_html: str, correct: int, kick_human: str,
+                 first_time: bool = True) -> str:
+    if first_time:
+        head = f"Привет, {mention_html}!"
+    else:
+        head = "⚠️ <b>Не та кнопка!</b>"
+    return (
+        f"{head} Нажми кнопку «<b>{correct}</b>», чтобы подтвердить, что ты человек.\n"
+        f"Если не нажмёшь в течение {kick_human}, я удалю тебя из чата."
+    )
 
 db.POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
 db.NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
@@ -877,7 +899,8 @@ async def remove_user(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"remove_user: job для {user_id} в чате {chat_id} уже неактуален")
         return
     pending_jobs.pop(key, None)
-
+    pending_verify.pop(key, None)
+    
     # ban и unban — независимо: если ban упал, unban всё равно нужен,
     # чтобы не оставить пользователя забаненным по ошибке.
     try:
@@ -903,36 +926,82 @@ async def remove_user(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Не удалось отредактировать сообщение {message_id}: {e}")
 
 
-async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query is None or query.message is None:
+        return
+
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     key = (chat_id, user_id)
 
-    job = pending_jobs.get(key)
-    if job is None:
+    data = query.data or ""
+    try:
+        pressed = int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+
+    # Нет активной верификации (истекла, уже подтверждён, или бот перезапускался)
+    if key not in pending_jobs or key not in pending_verify:
         await query.answer("⏳ Время истекло или вы уже подтверждены.", show_alert=True)
         return
 
-    # Сначала убираем из словаря, потом снимаем job — чтобы remove_user
-    # не сработал параллельно.
-    pending_jobs.pop(key, None)
-    try:
-        job.remove()
-    except Exception:
-        pass
+    correct = pending_verify[key]
 
-    await query.answer("✅ Подтверждено")
+    if pressed == correct:
+        # Успех
+        pending_verify.pop(key, None)
+        job = pending_jobs.pop(key, None)
+        if job is not None:
+            try:
+                job.remove()
+            except Exception:
+                pass
+
+        await query.answer("✅ Подтверждено")
+
+        user = query.from_user
+        user_name = user.full_name or user.first_name or "No name"
+        user_username = user.username or "no_username"
+        logger.info(
+            f"Пользователь {user_name} (@{user_username}) [ID: {user_id}] "
+            f"подтверждён в чате {chat_id} (кнопка {pressed})"
+        )
+
+        try:
+            await query.edit_message_text("✅ Вы подтверждены! Добро пожаловать в чат.")
+        except Exception as e:
+            logger.error(f"verify_callback edit failed: {e}")
+        return
+
+    # Не та кнопка — выбираем новую: не ту, что нажали, и не ту, что была правильной
+    exclude = {pressed, correct}
+    candidates = [n for n in range(1, VERIFY_BUTTONS + 1) if n not in exclude]
+    new_correct = random.choice(candidates)
+    pending_verify[key] = new_correct
+
+    await query.answer("Не та кнопка")
 
     user = query.from_user
-    user_name = user.full_name or user.first_name or "No name"
-    user_username = user.username or "no_username"
-    logger.info(f"Пользователь {user_name} (@{user_username}) [ID: {user_id}] подтверждён в чате {chat_id} (кнопка)")
-
     try:
-        await query.edit_message_text("✅ Вы подтверждены! Добро пожаловать в чат.")
+        mention_html = user.mention_html()
+    except Exception:
+        mention_html = user.full_name or "друг"
+    kick_human = _kick_human()
+    try:
+        await query.edit_message_text(
+            _verify_text(mention_html, new_correct, kick_human, first_time=False),
+            reply_markup=_verify_keyboard(),
+            parse_mode='HTML'
+        )
     except Exception as e:
-        logger.error(f"confirm_callback edit failed: {e}")
+        logger.error(f"verify_callback edit failed: {e}")
+
+    logger.info(
+        f"Неверная кнопка: chat={chat_id} user={user_id} "
+        f"pressed={pressed} new_correct={new_correct}"
+    )
 
 
 async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -995,18 +1064,18 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_full_name = new_member.full_name or new_member.first_name or "No name"
         user_username = new_member.username or "no_username"
 
-        keyboard = [[InlineKeyboardButton("✅ Я человек", callback_data="confirm")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        correct = random.randint(1, VERIFY_BUTTONS)
+        pending_verify[key] = correct
 
         try:
             sent_msg = await update.message.reply_text(
-                f"Привет, {new_member.mention_html()}! Нажми кнопку ниже, чтобы подтвердить, что ты человек.\n"
-                f"Если не нажмёшь в течение {kick_human}, я удалю тебя из чата.",
-                reply_markup=reply_markup,
+                _verify_text(new_member.mention_html(), correct, kick_human),
+                reply_markup=_verify_keyboard(),
                 parse_mode='HTML'
             )
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+            pending_verify.pop(key, None)
             continue
 
         job = context.job_queue.run_once(
@@ -1192,7 +1261,9 @@ def main():
     )
     application.add_handler(MessageReactionHandler(reaction_handler))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
-    application.add_handler(CallbackQueryHandler(confirm_callback, pattern="confirm"))
+    application.add_handler(
+        CallbackQueryHandler(verify_callback, pattern=r"^verify:[123]$")
+    )
 
     pair_handler = ConversationHandler(
         entry_points=[CommandHandler("pair", pair_start)],
