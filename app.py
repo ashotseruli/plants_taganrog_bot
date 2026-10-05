@@ -95,6 +95,7 @@ for _h in logging.getLogger().handlers:
     _h.setFormatter(_formatter)
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Фоновые задачи (держим ссылки, чтобы GC не съел) ---
 _background_tasks: set[asyncio.Task] = set()
@@ -123,7 +124,7 @@ def _spawn(coro) -> asyncio.Task:
 pending_jobs = {}
 pending_verify = {}   # (chat_id, user_id) -> правильная кнопка (1..3)
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.7.1"
+BOT_VERSION = "2.7.2"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
