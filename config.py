@@ -65,7 +65,7 @@ def validate_config(cfg: dict) -> None:
     if not isinstance(llm, dict):
         raise ValueError("config.yaml: 'llm' должен быть словарём")
     if not isinstance(llm.get("model"), str) or not llm["model"].strip():
-        raise ValueError("config.yaml: 'llm.model' отсутствует, не строка или пуст")        
+        raise ValueError("config.yaml: 'llm.model' отсутствует, не строка или пуст")
     num_keys = (
         "thinking_delay", "hard_timeout", "max_words", "max_input_chars",
         "history_max_messages", "history_max_chars",
@@ -89,3 +89,7 @@ def validate_config(cfg: dict) -> None:
             raise ValueError(f"config.yaml: 'new_member.{key}' должен быть числом ≥ 0")
     if nm["kick_after_seconds"] <= 0:
         raise ValueError("config.yaml: 'new_member.kick_after_seconds' должен быть > 0")
+    if "trap_window_seconds" not in nm:
+        raise ValueError("config.yaml: 'new_member.trap_window_seconds' отсутствует")
+    if not isinstance(nm["trap_window_seconds"], (int, float)) or nm["trap_window_seconds"] < 0:
+        raise ValueError("config.yaml: 'new_member.trap_window_seconds' должен быть числом ≥ 0")

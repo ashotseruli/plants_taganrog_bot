@@ -128,10 +128,7 @@ pending_jobs = {}
 # (chat_id, user_id) -> {"sent_at": monotonic}
 pending_verify: dict = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.8.0"
-
-# Окно trap: если callback пришёл быстрее — считаем ботом.
-TRAP_WINDOW_SECONDS = 1.0
+BOT_VERSION = "2.8.1"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -156,6 +153,7 @@ OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 
 # --- Константы ---
 MAX_MESSAGE_AGE_SECONDS = CFG["new_member"]["max_message_age_seconds"]
+TRAP_WINDOW_SECONDS = CFG["new_member"]["trap_window_seconds"]
 
 # Кулдаун на пользователя: из ENV, иначе из конфига, иначе 2.0.
 LLM_USER_COOLDOWN = float(
@@ -1167,7 +1165,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CFG, LLM_PROMPT_STATIC, PHRASES, THINKING_PLACEHOLDERS
     global LLM_THINKING_DELAY, LLM_HARD_TIMEOUT, LLM_MAX_WORDS, LLM_MAX_INPUT_CHARS
-    global MAX_MESSAGE_AGE_SECONDS
+    global MAX_MESSAGE_AGE_SECONDS, TRAP_WINDOW_SECONDS
     global LLM_USER_COOLDOWN
 
     user = update.effective_user
@@ -1197,6 +1195,7 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
         db.NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
         MAX_MESSAGE_AGE_SECONDS = CFG["new_member"]["max_message_age_seconds"]
+        TRAP_WINDOW_SECONDS = CFG["new_member"]["trap_window_seconds"]
 
         await update.message.reply_text(
             f"✅ Конфиг перезагружен.\n"

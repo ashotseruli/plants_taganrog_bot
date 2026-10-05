@@ -34,6 +34,7 @@ def _base_cfg():
         "new_member": {
             "kick_after_seconds": 60,
             "max_message_age_seconds": 300,
+            "trap_window_seconds": 1.0,
         },
     }
 
@@ -148,7 +149,7 @@ class TestLlm:
         cfg["llm"]["user_cooldown"] = "fast"
         with pytest.raises(ValueError, match="user_cooldown"):
             config.validate_config(cfg)
-            
+
     def test_missing_model(self):
         cfg = _base_cfg()
         del cfg["llm"]["model"]
@@ -165,7 +166,7 @@ class TestLlm:
         cfg = _base_cfg()
         cfg["llm"]["model"] = 42
         with pytest.raises(ValueError, match="model"):
-            config.validate_config(cfg)            
+            config.validate_config(cfg)
 
 
 class TestNewMember:
@@ -190,5 +191,17 @@ class TestNewMember:
     def test_negative_age(self):
         cfg = _base_cfg()
         cfg["new_member"]["max_message_age_seconds"] = -1
+        with pytest.raises(ValueError):
+            config.validate_config(cfg)
+
+    def test_missing_trap_window(self):
+        cfg = _base_cfg()
+        del cfg["new_member"]["trap_window_seconds"]
+        with pytest.raises(ValueError, match="trap_window_seconds"):
+            config.validate_config(cfg)
+
+    def test_negative_trap_window(self):
+        cfg = _base_cfg()
+        cfg["new_member"]["trap_window_seconds"] = -0.5
         with pytest.raises(ValueError):
             config.validate_config(cfg)

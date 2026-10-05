@@ -46,6 +46,7 @@ _TEST_CFG = {
     "new_member": {
         "kick_after_seconds": 60,
         "max_message_age_seconds": 300,
+        "trap_window_seconds": 1.0,
     },
 }
 (_TMP / "config.yaml").write_text(
