@@ -95,6 +95,9 @@ for _h in logging.getLogger().handlers:
     _h.setFormatter(_formatter)
 
 logger = logging.getLogger(__name__)
+
+# httpx пишет INFO на каждый HTTP-запрос — это шум в system.log.
+# Ошибки (WARNING+) остаются видны.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Фоновые задачи (держим ссылки, чтобы GC не съел) ---
@@ -122,9 +125,13 @@ def _spawn(coro) -> asyncio.Task:
 
 # --- Хранилище ---
 pending_jobs = {}
-pending_verify = {}   # (chat_id, user_id) -> правильная кнопка (1..3)
+# (chat_id, user_id) -> {"sent_at": monotonic}
+pending_verify: dict = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.7.2"
+BOT_VERSION = "2.8.0"
+
+# Окно trap: если callback пришёл быстрее — считаем ботом.
+TRAP_WINDOW_SECONDS = 1.0
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -161,27 +168,6 @@ def _kick_human() -> str:
     sec = CFG["new_member"]["kick_after_seconds"]
     return f"{sec // 60} мин" if sec >= 60 else f"{sec} сек"
 
-VERIFY_BUTTONS = 3
-
-
-def _verify_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура с тремя кнопками 1|2|3."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(str(n), callback_data=f"verify:{n}")
-        for n in range(1, VERIFY_BUTTONS + 1)
-    ]])
-
-
-def _verify_text(mention_html: str, correct: int, kick_human: str,
-                 first_time: bool = True) -> str:
-    if first_time:
-        head = f"Привет, {mention_html}!"
-    else:
-        head = "⚠️ <b>Не та кнопка!</b>"
-    return (
-        f"{head} Нажми кнопку «<b>{correct}</b>», чтобы подтвердить, что ты человек.\n"
-        f"Если не нажмёшь в течение {kick_human}, я удалю тебя из чата."
-    )
 
 db.POSITIVE_REACTIONS = set(CFG["reactions"]["positive"])
 db.NEGATIVE_REACTIONS = set(CFG["reactions"]["negative"])
@@ -266,13 +252,13 @@ def get_chat_logger(chat_id: int, chat_type: str,
 def get_user_mention(user):
     return f"@{user.username}" if user.username else (user.first_name or "Товарищ")
 
+
 def extract_emojis(reactions) -> set:
     """Из списка ReactionType возвращает set строк-идентификаторов реакций.
 
     Кастомные эмодзи маркируются префиксом 'custom:<id>'.
     В POSITIVE_REACTIONS / NEGATIVE_REACTIONS такие строки не задаются —
-    кастомные реакции по умолчанию игнорируются. Если нужно учитывать —
-    добавьте их id в конфиг в формате 'custom:<id>'."""
+    кастомные реакции по умолчанию игнорируются."""
     result = set()
     if not reactions:
         return result
@@ -444,8 +430,6 @@ async def karma_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         source = "mention"
                         break
                     mention_not_found = True
-        # Если пользователь явно упомянул кого-то через @, но мы его не знаем —
-        # не подменяем цель на отправителя, а честно сообщаем.
         if target_id is None and mention_not_found:
             await msg.reply_text(
                 "❌ Пользователь с таким @username не найден в базе. "
@@ -462,7 +446,6 @@ async def karma_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = int(time.time())
     month_ago = now - 30 * 24 * 3600
 
-    # Считаем каждую метрику один раз и переиспользуем для ранга.
     total_karma = await db.db_get_karma_a(target_id)
     month_karma = await db.db_get_karma_a(target_id, month_ago)
     total_rank = await db.db_get_rank_a(target_id, since=0, karma_user=total_karma)
@@ -560,7 +543,6 @@ async def karmapurge_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("❌ Нужно целое число дней ≥ 0 (0 = очистить всё).")
         return
 
-    # Защита от случайного сноса всей истории: /karmapurge 0 требует confirm.
     if days == 0 and (len(context.args) < 2 or context.args[1].lower() != "confirm"):
         await msg.reply_text(
             "⚠️ <code>/karmapurge 0</code> сотрёт <b>всю</b> историю кармы и сообщений.\n"
@@ -604,6 +586,241 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 Версия бота: {BOT_VERSION}")
 
 
+# =========================================================
+#                  ВЕРИФИКАЦИЯ НОВЫХ УЧАСТНИКОВ
+# =========================================================
+
+def _verify_keyboard() -> InlineKeyboardMarkup:
+    """Одна большая кнопка «Подтвердить». В ряду она одна — занимает всю ширину."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Подтвердить", callback_data="verify:ok")
+    ]])
+
+
+def _verify_text(mention_html: str, kick_human: str,
+                 first_time: bool = True) -> str:
+    if first_time:
+        head = f"Привет, {mention_html}!"
+    else:
+        head = "⚠️ <b>Не та кнопка!</b>"
+    return (
+        f"{head} Нажми большую кнопку «✅ Подтвердить», чтобы доказать, "
+        f"что ты человек.\n"
+        f"Если не нажмёшь в течение {kick_human}, я удалю тебя из чата."
+    )
+
+
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    key = (chat_id, user_id)
+
+    if query.data != "verify:ok":
+        await query.answer()
+        return
+
+    # Нет активной верификации (истекла или уже подтверждён)
+    if key not in pending_jobs or key not in pending_verify:
+        await query.answer("⏳ Время истекло или вы уже подтверждены.",
+                           show_alert=True)
+        return
+
+    info = pending_verify[key]
+    elapsed = time.monotonic() - info.get("sent_at", 0.0)
+
+    # --- Trap: слишком быстро для человека ---
+    if elapsed < TRAP_WINDOW_SECONDS:
+        pending_verify.pop(key, None)
+        job = pending_jobs.pop(key, None)
+        if job is not None:
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
+
+        logger.info(
+            "verify trap: chat=%s user=%s elapsed=%.3fs — кик",
+            chat_id, user_id, elapsed,
+        )
+
+        try:
+            await query.answer("❌ Слишком быстро. Похоже, ты бот.",
+                               show_alert=True)
+        except Exception:
+            pass
+
+        try:
+            await query.edit_message_text("❌ Похоже, ты бот. Удалён.")
+        except Exception as e:
+            logger.error(f"trap edit failed: {e}")
+
+        try:
+            await context.bot.ban_chat_member(chat_id, user_id)
+            await context.bot.unban_chat_member(chat_id, user_id)
+            logger.info(f"trap: забанен и разбанен {user_id} в чате {chat_id}")
+        except Exception as e:
+            logger.error(f"trap ban/unban failed: {e}")
+        return
+
+    # --- Успех ---
+    pending_verify.pop(key, None)
+    job = pending_jobs.pop(key, None)
+    if job is not None:
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
+
+    await query.answer("✅ Подтверждено")
+
+    user = query.from_user
+    user_name = user.full_name or user.first_name or "No name"
+    user_username = user.username or "no_username"
+    logger.info(
+        "Пользователь %s (@%s) [ID: %s] подтверждён в чате %s (за %.2fs)",
+        user_name, user_username, user_id, chat_id, elapsed,
+    )
+
+    try:
+        await query.edit_message_text("✅ Вы подтверждены! Добро пожаловать в чат.")
+    except Exception as e:
+        logger.error(f"verify_callback edit failed: {e}")
+
+
+async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+
+    chat_id = update.message.chat_id
+
+    now_utc = datetime.now(timezone.utc)
+    msg_time = update.effective_message.date
+    if msg_time < now_utc - timedelta(seconds=MAX_MESSAGE_AGE_SECONDS):
+        logger.info(f"Пропускаем устаревшее сообщение о новом участнике от {msg_time}")
+        return
+
+    if context.job_queue is None:
+        logger.error("JobQueue не инициализирован — пропускаем обработку нового участника")
+        return
+
+    try:
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except Exception as e:
+        logger.error(f"Не удалось получить информацию о боте в чате {chat_id}: {e}")
+        return
+
+    can_restrict = getattr(bot_member, "can_restrict_members", False)
+    if bot_member.status not in ("creator", "administrator") or not can_restrict:
+        logger.warning(f"Бот не имеет прав на удаление участников в чате {chat_id}")
+        return
+
+    if threads.is_duplicate(chat_id, update.message.message_id, 0):
+        logger.info(
+            "skip duplicate new_member: chat=%s msg_id=%s",
+            chat_id, update.message.message_id,
+        )
+        return
+
+    kick_human = _kick_human()
+
+    for new_member in update.message.new_chat_members:
+        if new_member.id == context.bot.id:
+            continue
+
+        user_id = new_member.id
+        key = (chat_id, user_id)
+
+        if key in pending_jobs:
+            old_job = pending_jobs.pop(key)
+            if old_job:
+                try:
+                    old_job.schedule_removal()
+                except Exception:
+                    pass
+
+        user_full_name = new_member.full_name or new_member.first_name or "No name"
+        user_username = new_member.username or "no_username"
+
+        try:
+            sent_msg = await update.message.reply_text(
+                _verify_text(new_member.mention_html(), kick_human),
+                reply_markup=_verify_keyboard(),
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+            continue
+
+        # Запоминаем момент отправки для trap-проверки в callback.
+        pending_verify[key] = {"sent_at": time.monotonic()}
+
+        job = context.job_queue.run_once(
+            remove_user,
+            when=CFG["new_member"]["kick_after_seconds"],
+            data={
+                'chat_id': chat_id,
+                'user_id': user_id,
+                'user_name': user_full_name,
+                'user_username': user_username,
+                'message_id': sent_msg.message_id
+            },
+            name=f"remove_{chat_id}_{user_id}"
+        )
+        pending_jobs[key] = job
+
+        logger.info(
+            f"Новый пользователь {user_full_name} (@{user_username}) [ID: {user_id}] "
+            f"зашёл в чат {chat_id}, отправлена кнопка подтверждения."
+        )
+
+
+async def remove_user(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data
+    chat_id = data['chat_id']
+    user_id = data['user_id']
+    user_name = data.get('user_name', 'Unknown')
+    user_username = data.get('user_username', 'no_username')
+    message_id = data.get('message_id')
+
+    key = (chat_id, user_id)
+    if pending_jobs.get(key) is not job:
+        logger.info(f"remove_user: job для {user_id} в чате {chat_id} уже неактуален")
+        return
+    pending_jobs.pop(key, None)
+    pending_verify.pop(key, None)
+
+    try:
+        await context.bot.ban_chat_member(chat_id, user_id)
+        logger.info(f"Забанен {user_name} (@{user_username}) [ID: {user_id}] в чате {chat_id}")
+    except Exception as e:
+        logger.error(f"Не удалось забанить {user_id} в чате {chat_id}: {e}")
+
+    try:
+        await context.bot.unban_chat_member(chat_id, user_id)
+        logger.info(f"Разбанен {user_name} (@{user_username}) [ID: {user_id}] в чате {chat_id}")
+    except Exception as e:
+        logger.error(f"Не удалось разбанить {user_id} в чате {chat_id}: {e}")
+
+    if message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="❌ Время истекло, бот пристрелен"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отредактировать сообщение {message_id}: {e}")
+
+
+# =========================================================
+#                       LLM
+# =========================================================
+
 async def _call_ollama_async(
     user_message: str,
     chat_id: "int | None" = None,
@@ -630,13 +847,13 @@ async def _call_ollama_async(
     }
     return await llm.post_chat(messages, options)
 
+
 async def send_smart_reply(message_obj, user_message: str,
                            chat_id: "int | None" = None,
                            chat_type: "str | None" = None,
                            chat_title: "str | None" = None,
                            thread_id: "int | None" = None,
                            user=None):
-    # _spawn держит ссылку в _background_tasks — задача отменится на shutdown.
     llm_task = _spawn(_call_ollama_async(user_message, chat_id, thread_id))
     placeholder = None
     reply_text = None
@@ -731,7 +948,7 @@ async def send_smart_reply(message_obj, user_message: str,
             logger.error(f"chat log write failed: {e}")
 
     # В историю пишем только успешный ответ LLM — фолбэк-фразы не должны
-    # попадать в контекст, иначе они загрязняют промпт и портят следующие ответы.
+    # попадать в контекст.
     if (chat_id is not None and thread_id is not None
             and user_message.strip() and not used_fallback):
         hist = threads.get_history(chat_id, thread_id)
@@ -775,7 +992,6 @@ async def _handle_llm_turn(update, context, edit_ts=None):
                     chat.id, msg.message_id, edit_ts)
         return
 
-    # Rate limit: не даём спамить LLM одному пользователю.
     now = time.monotonic()
     rl_key = (chat.id, user.id)
     last = _llm_last_call.get(rl_key, 0.0)
@@ -800,10 +1016,6 @@ async def _handle_llm_turn(update, context, edit_ts=None):
     except Exception as e:
         logger.error(f"chat log write failed: {e}")
 
-    # Сериализуем обработку внутри треда: пока LLM не ответил на предыдущее
-    # сообщение, следующее в том же треде подождёт. Это гарантирует корректный
-    # порядок пар user/assistant в истории при concurrent_updates.
-    # Трейд-офф: сообщения одного юзера в одном треде обрабатываются подряд.
     lock = threads.get_thread_lock(chat.id, thread_id)
 
     async def _do_turn():
@@ -822,7 +1034,6 @@ async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None:
         return
-    # Игнорируем апдейты без текста/подписи (стикеры, войсы, гифки и т.п.).
     if not (msg.text or msg.caption):
         return
 
@@ -841,14 +1052,15 @@ async def talk_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mentioned and not reply_to_bot:
             return
     elif edit_ts != 0:
-        # В привате обычные сообщения идут к LLM без условий. Но edit —
-        # это правка опечатки или случайный триггер; реагируем только если
-        # пользователь явно упомянул бота или ответил на его сообщение.
         if not mentioned and not reply_to_bot:
             return
 
     await _handle_llm_turn(update, context, edit_ts=edit_ts)
 
+
+# =========================================================
+#                       PAIR
+# =========================================================
 
 async def pair_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -886,218 +1098,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def remove_user(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    data = job.data
-    chat_id = data['chat_id']
-    user_id = data['user_id']
-    user_name = data.get('user_name', 'Unknown')
-    user_username = data.get('user_username', 'no_username')
-    message_id = data.get('message_id')
-
-    key = (chat_id, user_id)
-    if pending_jobs.get(key) is not job:
-        logger.info(f"remove_user: job для {user_id} в чате {chat_id} уже неактуален")
-        return
-    pending_jobs.pop(key, None)
-    pending_verify.pop(key, None)
-    
-    # ban и unban — независимо: если ban упал, unban всё равно нужен,
-    # чтобы не оставить пользователя забаненным по ошибке.
-    try:
-        await context.bot.ban_chat_member(chat_id, user_id)
-        logger.info(f"Забанен {user_name} (@{user_username}) [ID: {user_id}] в чате {chat_id}")
-    except Exception as e:
-        logger.error(f"Не удалось забанить {user_id} в чате {chat_id}: {e}")
-
-    try:
-        await context.bot.unban_chat_member(chat_id, user_id)
-        logger.info(f"Разбанен {user_name} (@{user_username}) [ID: {user_id}] в чате {chat_id}")
-    except Exception as e:
-        logger.error(f"Не удалось разбанить {user_id} в чате {chat_id}: {e}")
-
-    if message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text="❌ Время истекло, бот пристрелен"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отредактировать сообщение {message_id}: {e}")
-
-
-async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query is None or query.message is None:
-        return
-
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    key = (chat_id, user_id)
-
-    data = query.data or ""
-    try:
-        pressed = int(data.split(":", 1)[1])
-    except (IndexError, ValueError):
-        await query.answer()
-        return
-
-    # Нет активной верификации (истекла, уже подтверждён, или бот перезапускался)
-    if key not in pending_jobs or key not in pending_verify:
-        await query.answer("⏳ Время истекло или вы уже подтверждены.", show_alert=True)
-        return
-
-    correct = pending_verify[key]
-
-    if pressed == correct:
-        # Успех
-        pending_verify.pop(key, None)
-        job = pending_jobs.pop(key, None)
-        if job is not None:
-            try:
-                job.remove()
-            except Exception:
-                pass
-
-        await query.answer("✅ Подтверждено")
-
-        user = query.from_user
-        user_name = user.full_name or user.first_name or "No name"
-        user_username = user.username or "no_username"
-        logger.info(
-            f"Пользователь {user_name} (@{user_username}) [ID: {user_id}] "
-            f"подтверждён в чате {chat_id} (кнопка {pressed})"
-        )
-
-        try:
-            await query.edit_message_text("✅ Вы подтверждены! Добро пожаловать в чат.")
-        except Exception as e:
-            logger.error(f"verify_callback edit failed: {e}")
-        return
-
-    # Не та кнопка — выбираем новую: не ту, что нажали, и не ту, что была правильной
-    exclude = {pressed, correct}
-    candidates = [n for n in range(1, VERIFY_BUTTONS + 1) if n not in exclude]
-    new_correct = random.choice(candidates)
-    pending_verify[key] = new_correct
-
-    await query.answer("Не та кнопка")
-
-    user = query.from_user
-    try:
-        mention_html = user.mention_html()
-    except Exception:
-        mention_html = user.full_name or "друг"
-    kick_human = _kick_human()
-    try:
-        await query.edit_message_text(
-            _verify_text(mention_html, new_correct, kick_human, first_time=False),
-            reply_markup=_verify_keyboard(),
-            parse_mode='HTML'
-        )
-    except Exception as e:
-        logger.error(f"verify_callback edit failed: {e}")
-
-    logger.info(
-        f"Неверная кнопка: chat={chat_id} user={user_id} "
-        f"pressed={pressed} new_correct={new_correct}"
-    )
-
-
-async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.new_chat_members:
-        return
-
-    chat_id = update.message.chat_id
-
-    now_utc = datetime.now(timezone.utc)
-    msg_time = update.effective_message.date
-    if msg_time < now_utc - timedelta(seconds=MAX_MESSAGE_AGE_SECONDS):
-        logger.info(f"Пропускаем устаревшее сообщение о новом участнике от {msg_time}")
-        return
-
-    # JobQueue проверяем до всех действий — иначе можем отправить кнопку,
-    # а джоба на удаление не будет.
-    if context.job_queue is None:
-        logger.error("JobQueue не инициализирован — пропускаем обработку нового участника")
-        return
-
-    try:
-        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-    except Exception as e:
-        logger.error(f"Не удалось получить информацию о боте в чате {chat_id}: {e}")
-        return
-
-    # У ChatMemberOwner нет can_restrict_members — берём через getattr.
-    can_restrict = getattr(bot_member, "can_restrict_members", False)
-    if bot_member.status not in ("creator", "administrator") or not can_restrict:
-        logger.warning(f"Бот не имеет прав на удаление участников в чате {chat_id}")
-        return
-
-    # Дубли апдейта о новом участнике плодят вторую кнопку/джоб — режем.
-    # Дедуп ставим после валидации, чтобы не «съесть» потенциально валидный
-    # повтор, если в первый раз бот не имел прав.
-    if threads.is_duplicate(chat_id, update.message.message_id, 0):
-        logger.info(
-            "skip duplicate new_member: chat=%s msg_id=%s",
-            chat_id, update.message.message_id,
-        )
-        return
-
-    kick_human = _kick_human()
-
-    for new_member in update.message.new_chat_members:
-        if new_member.id == context.bot.id:
-            continue
-
-        user_id = new_member.id
-        key = (chat_id, user_id)
-
-        if key in pending_jobs:
-            old_job = pending_jobs.pop(key)
-            if old_job:
-                try:
-                    old_job.remove()
-                except Exception:
-                    pass
-
-        user_full_name = new_member.full_name or new_member.first_name or "No name"
-        user_username = new_member.username or "no_username"
-
-        correct = random.randint(1, VERIFY_BUTTONS)
-        pending_verify[key] = correct
-
-        try:
-            sent_msg = await update.message.reply_text(
-                _verify_text(new_member.mention_html(), correct, kick_human),
-                reply_markup=_verify_keyboard(),
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-            pending_verify.pop(key, None)
-            continue
-
-        job = context.job_queue.run_once(
-            remove_user,
-            when=CFG["new_member"]["kick_after_seconds"],
-            data={
-                'chat_id': chat_id,
-                'user_id': user_id,
-                'user_name': user_full_name,
-                'user_username': user_username,
-                'message_id': sent_msg.message_id
-            },
-            name=f"remove_{chat_id}_{user_id}"
-        )
-        pending_jobs[key] = job
-
-        logger.info(
-            f"Новый пользователь {user_full_name} (@{user_username}) [ID: {user_id}] "
-            f"зашёл в чат {chat_id}, отправлена кнопка подтверждения."
-        )
-
+# =========================================================
+#                  WARMUP / LIFECYCLE
+# =========================================================
 
 async def warmup_llm():
     logger.info("LLM warmup started...")
@@ -1108,7 +1111,6 @@ async def warmup_llm():
         logger.warning(f"LLM warmup failed: {e}")
 
 
-# ----- post_init / post_shutdown -----
 async def post_init(application: Application):
     try:
         await application.bot.set_my_commands([
@@ -1127,7 +1129,6 @@ async def post_init(application: Application):
 
 
 async def post_shutdown(application: Application):
-    # Ожидающие кики не переживают рестарт — логируем, чтобы понимать масштаб.
     if pending_jobs:
         logger.warning(
             "При завершении осталось %d необработанных задач на кик. "
@@ -1136,8 +1137,6 @@ async def post_shutdown(application: Application):
             len(pending_jobs),
         )
 
-    # Сначала гасим фоновые задачи (могут держать соединения),
-    # затем закрываем общий HTTP-клиент и чистим локи.
     if _background_tasks:
         logger.info("Отменяю %d фоновых задач...", len(_background_tasks))
         for t in list(_background_tasks):
@@ -1146,6 +1145,7 @@ async def post_shutdown(application: Application):
         _background_tasks.clear()
     threads.clear_all_locks()
     await llm.close_http_client()
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     update_id = getattr(update, "update_id", None)
@@ -1159,6 +1159,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         update_id, chat_id, exc_info=context.error,
     )
 
+
+# =========================================================
+#                  СКРЫТЫЕ КОМАНДЫ
+# =========================================================
 
 async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CFG, LLM_PROMPT_STATIC, PHRASES, THINKING_PLACEHOLDERS
@@ -1222,7 +1226,10 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"thread cleared: chat={chat.id} thread={thread_id}")
 
 
-# ----- Главная -----
+# =========================================================
+#                       MAIN
+# =========================================================
+
 def main():
     _force_ipv4()
 
@@ -1231,16 +1238,12 @@ def main():
     application = (
         Application.builder()
         .token(TOKEN)
-        # По умолчанию — официальный Telegram API. Прокси включается явно через ENV.
         .base_url(os.getenv("TG_BASE_URL", "https://api.telegram.org/bot"))
         .base_file_url(os.getenv("TG_BASE_FILE_URL", "https://api.telegram.org/file/bot"))
         .connect_timeout(30.0)
         .read_timeout(30.0)
         .write_timeout(30.0)
         .pool_timeout(30.0)
-        # Параллельная обработка апдейтов: пока один пользователь ждёт LLM,
-        # остальные сообщения/реакции/входы обрабатываются.
-        # 64 — жёсткий потолок параллельных корутин (сглаживает пики апдейтов).
         .concurrent_updates(64)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
@@ -1263,7 +1266,7 @@ def main():
     application.add_handler(MessageReactionHandler(reaction_handler))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
     application.add_handler(
-        CallbackQueryHandler(verify_callback, pattern=r"^verify:[123]$")
+        CallbackQueryHandler(verify_callback, pattern=r"^verify:ok$")
     )
 
     pair_handler = ConversationHandler(
