@@ -300,7 +300,18 @@ def db_find_user_by_username(username: str):
     finally:
         conn.close()
 
-
+def db_get_user(user_id: int):
+    """Возвращает (user_id, username, first_name) или None."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT user_id, username, first_name FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+        
 # --- Async-обёртки для БД (не блокируем event loop) ---
 
 def _to_thread(func):
@@ -320,3 +331,4 @@ db_get_karma_a = _to_thread(db_get_karma)
 db_get_rank_a = _to_thread(db_get_rank)
 db_get_top_a = _to_thread(db_get_top)
 db_find_user_by_username_a = _to_thread(db_find_user_by_username)
+db_get_user_a = _to_thread(db_get_user)

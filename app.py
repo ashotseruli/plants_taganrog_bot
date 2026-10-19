@@ -125,10 +125,10 @@ def _spawn(coro) -> asyncio.Task:
 
 # --- Хранилище ---
 pending_jobs = {}
-# (chat_id, user_id) -> {"sent_at": monotonic}
+# (chat_id, user_id) -> {"sent_at": monotonic, "message_id": int}
 pending_verify: dict = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.8.2"
+BOT_VERSION = "2.8.5"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -194,6 +194,35 @@ GROUP_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _chat_loggers = OrderedDict()
 _CHAT_LOGGERS_LIMIT = 200
+
+# Кэш названий чатов для читаемых логов. LRU на 200 записей.
+_chat_titles: "OrderedDict[int, str]" = OrderedDict()
+_CHAT_TITLES_LIMIT = 200
+
+
+async def _chat_title(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                      fallback: str | None = None) -> str:
+    """Возвращает человекочитаемое название чата. Кэширует."""
+    if chat_id in _chat_titles:
+        _chat_titles.move_to_end(chat_id)
+        return _chat_titles[chat_id]
+    title = fallback
+    if not title:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            title = (
+                getattr(chat, "title", None)
+                or getattr(chat, "username", None)
+                or getattr(chat, "first_name", None)
+                or str(chat_id)
+            )
+        except Exception:
+            title = str(chat_id)
+    _chat_titles[chat_id] = title
+    _chat_titles.move_to_end(chat_id)
+    while len(_chat_titles) > _CHAT_TITLES_LIMIT:
+        _chat_titles.popitem(last=False)
+    return title
 
 
 def get_chat_logger(chat_id: int, chat_type: str,
@@ -272,6 +301,32 @@ def extract_emojis(reactions) -> set:
     return result
 
 
+def _user_repr(username: str | None, first_name: str | None,
+               user_id: int) -> str:
+    """Человекочитаемое имя для логов: @username (Имя) или [id]."""
+    parts = []
+    if username:
+        parts.append(f"@{username}")
+    if first_name:
+        parts.append(f"({first_name})")
+    if parts:
+        return " ".join(parts)
+    return f"[{user_id}]"
+
+
+def _msg_repr(msg_obj, message_id: int) -> str:
+    """msg=ID "превью" или msg=ID, если текста нет."""
+    text = None
+    if msg_obj is not None:
+        text = getattr(msg_obj, "text", None) or getattr(msg_obj, "caption", None)
+    if text:
+        preview = text.replace("\n", " ").strip()
+        if len(preview) > 30:
+            preview = preview[:30] + "…"
+        return f'msg={message_id} "{preview}"'
+    return f"msg={message_id}"
+
+
 def _entity_text(msg, ent) -> str:
     """Безопасно достаёт текст сущности, учитывая UTF-16 offset (Telegram API)."""
     text = msg.text or msg.caption or ""
@@ -345,10 +400,21 @@ async def reaction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     author_id = await db.db_get_message_author_a(chat_id, message_id)
     if author_id is None:
+        chat_title = await _chat_title(
+            chat_id, context, getattr(reaction.chat, "title", None)
+        )
+        msg_repr = _msg_repr(getattr(reaction, "message", None), message_id)
+        reactor_repr = _user_repr(
+            getattr(reactor, "username", None),
+            getattr(reactor, "first_name", None),
+            reactor_id,
+        )
         logger.info(
-            "reaction: msg %s в чате %s не найден в БД — пропускаем "
-            "(reactor=%s, old=%s, new=%s)",
-            message_id, chat_id, reactor_id, old_emojis, new_emojis
+            "reaction: [%s] %s — сообщение не найдено в БД, пропускаем "
+            "(реактор=%s, old=%s, new=%s)",
+            chat_title, msg_repr, reactor_repr,
+            ", ".join(sorted(old_emojis)) or "—",
+            ", ".join(sorted(new_emojis)) or "—",
         )
         return
 
@@ -360,16 +426,34 @@ async def reaction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Читаемые имена для лога.
+    author_row = await db.db_get_user_a(author_id)
+    author_repr = (
+        _user_repr(author_row[1], author_row[2], author_id)
+        if author_row else f"[{author_id}]"
+    )
+    reactor_repr = _user_repr(
+        getattr(reactor, "username", None),
+        getattr(reactor, "first_name", None),
+        reactor_id,
+    )
+
+    chat_title = await _chat_title(
+        chat_id, context, getattr(reaction.chat, "title", None)
+    )
+    msg_repr = _msg_repr(getattr(reaction, "message", None), message_id)
+
+    old_repr = ", ".join(sorted(old_emojis)) or "—"
+    new_repr = ", ".join(sorted(new_emojis)) or "—"
+
     try:
         await db.db_replace_reactions_a(
             chat_id, message_id, reactor_id, old_emojis, new_emojis, now
         )
         logger.info(
-            "reaction: chat=%s msg=%s автор=%s реактор=%s old=%s new=%s "
-            "(удалено=%s, добавлено=%s)",
-            chat_id, message_id, author_id, reactor_id,
-            old_emojis, new_emojis,
-            old_emojis - new_emojis, new_emojis - old_emojis,
+            "reaction: [%s] %s автор=%s реактор=%s old=%s new=%s",
+            chat_title, msg_repr, author_repr, reactor_repr,
+            old_repr, new_repr,
         )
     except Exception as e:
         logger.error(f"reaction_handler: {e}")
@@ -580,8 +664,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/karma @username – карма указанного пользователя\n"
         "/top – топ-5 за месяц и за всё время\n"
         "/version – версия бота\n"
-        f"А ещё я проверяю новых участников и удаляю их, если они не нажимают "
-        f"кнопку подтверждения в течение {_kick_human()}.\n"
+        f"А ещё я проверяю новых участников и удаляю их, если они не ставят "
+        f"реакцию {VERIFY_REACTION} в течение {_kick_human()}.\n"
         "И считаю карму по реакциям (👍 +1, 👎 −1)."
     )
 
@@ -601,6 +685,7 @@ def _verify_text(mention_html: str, kick_human: str) -> str:
         f"что ты человек.\n"
         f"Если не успеешь за {kick_human} — удалю."
     )
+
 
 async def _check_verify_reaction(update: Update,
                                  context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -648,9 +733,16 @@ async def _check_verify_reaction(update: Update,
 
     # --- Trap: слишком быстро для человека ---
     if elapsed < TRAP_WINDOW_SECONDS:
+        chat_title = await _chat_title(
+            chat_id, context, getattr(reaction.chat, "title", None)
+        )
         logger.info(
-            "verify trap (reaction): chat=%s user=%s elapsed=%.3fs — кик",
-            chat_id, reactor.id, elapsed,
+            "verify trap (reaction): [%s] user=%s elapsed=%.3fs — кик",
+            chat_title, _user_repr(
+                getattr(reactor, "username", None),
+                getattr(reactor, "first_name", None),
+                reactor.id,
+            ), elapsed,
         )
         try:
             await context.bot.ban_chat_member(chat_id, reactor.id)
@@ -667,12 +759,17 @@ async def _check_verify_reaction(update: Update,
         return True
 
     # --- Успех ---
-    user_name = reactor.full_name or reactor.first_name or "No name"
-    user_username = reactor.username or "no_username"
+    chat_title = await _chat_title(
+        chat_id, context, getattr(reaction.chat, "title", None)
+    )
     logger.info(
-        "Пользователь %s (@%s) [ID: %s] подтверждён в чате %s "
-        "(за %.2fs, реакция)",
-        user_name, user_username, reactor.id, chat_id, elapsed,
+        "Пользователь %s подтверждён в [%s] (за %.2fs, реакция)",
+        _user_repr(
+            getattr(reactor, "username", None),
+            getattr(reactor, "first_name", None),
+            reactor.id,
+        ),
+        chat_title, elapsed,
     )
     try:
         await context.bot.edit_message_text(
@@ -682,6 +779,7 @@ async def _check_verify_reaction(update: Update,
     except Exception as e:
         logger.error(f"verify edit failed: {e}")
     return True
+
 
 async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
@@ -767,9 +865,13 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         pending_jobs[key] = job
 
+        chat_title = await _chat_title(
+            chat_id, context, getattr(update.effective_chat, "title", None)
+        )
         logger.info(
-            f"Новый пользователь {user_full_name} (@{user_username}) [ID: {user_id}] "
-            f"зашёл в чат {chat_id}, отправлена кнопка подтверждения."
+            "Новый пользователь %s (@%s) [ID: %s] зашёл в [%s], "
+            "отправлено сообщение верификации.",
+            user_full_name, user_username, user_id, chat_title,
         )
 
 
@@ -788,16 +890,23 @@ async def remove_user(context: ContextTypes.DEFAULT_TYPE):
         return
     pending_jobs.pop(key, None)
     pending_verify.pop(key, None)
+    chat_title = await _chat_title(chat_id, context)
 
     try:
         await context.bot.ban_chat_member(chat_id, user_id)
-        logger.info(f"Забанен {user_name} (@{user_username}) [ID: {user_id}] в чате {chat_id}")
+        logger.info(
+            "Забанен %s (@%s) [ID: %s] в [%s]",
+            user_name, user_username, user_id, chat_title,
+        )
     except Exception as e:
         logger.error(f"Не удалось забанить {user_id} в чате {chat_id}: {e}")
 
     try:
         await context.bot.unban_chat_member(chat_id, user_id)
-        logger.info(f"Разбанен {user_name} (@{user_username}) [ID: {user_id}] в чате {chat_id}")
+        logger.info(
+            "Разбанен %s (@%s) [ID: %s] в [%s]",
+            user_name, user_username, user_id, chat_title,
+        )
     except Exception as e:
         logger.error(f"Не удалось разбанить {user_id} в чате {chat_id}: {e}")
 
