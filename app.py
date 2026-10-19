@@ -48,6 +48,8 @@ from utils import (
     safe_format,
     msg_edit_ts,
     trim_history,
+    user_repr,
+    msg_repr,
 )
 
 # --- Пути (не зависим от CWD) ---
@@ -128,7 +130,7 @@ pending_jobs = {}
 # (chat_id, user_id) -> {"sent_at": monotonic, "message_id": int}
 pending_verify: dict = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.8.5"
+BOT_VERSION = "2.8.6"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -301,32 +303,6 @@ def extract_emojis(reactions) -> set:
     return result
 
 
-def _user_repr(username: str | None, first_name: str | None,
-               user_id: int) -> str:
-    """Человекочитаемое имя для логов: @username (Имя) или [id]."""
-    parts = []
-    if username:
-        parts.append(f"@{username}")
-    if first_name:
-        parts.append(f"({first_name})")
-    if parts:
-        return " ".join(parts)
-    return f"[{user_id}]"
-
-
-def _msg_repr(msg_obj, message_id: int) -> str:
-    """msg=ID "превью" или msg=ID, если текста нет."""
-    text = None
-    if msg_obj is not None:
-        text = getattr(msg_obj, "text", None) or getattr(msg_obj, "caption", None)
-    if text:
-        preview = text.replace("\n", " ").strip()
-        if len(preview) > 30:
-            preview = preview[:30] + "…"
-        return f'msg={message_id} "{preview}"'
-    return f"msg={message_id}"
-
-
 def _entity_text(msg, ent) -> str:
     """Безопасно достаёт текст сущности, учитывая UTF-16 offset (Telegram API)."""
     text = msg.text or msg.caption or ""
@@ -403,8 +379,8 @@ async def reaction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_title = await _chat_title(
             chat_id, context, getattr(reaction.chat, "title", None)
         )
-        msg_repr = _msg_repr(getattr(reaction, "message", None), message_id)
-        reactor_repr = _user_repr(
+        msg_repr = msg_repr(getattr(reaction, "message", None), message_id)
+        reactor_repr = user_repr(
             getattr(reactor, "username", None),
             getattr(reactor, "first_name", None),
             reactor_id,
@@ -429,10 +405,10 @@ async def reaction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Читаемые имена для лога.
     author_row = await db.db_get_user_a(author_id)
     author_repr = (
-        _user_repr(author_row[1], author_row[2], author_id)
+        user_repr(author_row[1], author_row[2], author_id)
         if author_row else f"[{author_id}]"
     )
-    reactor_repr = _user_repr(
+    reactor_repr = user_repr(
         getattr(reactor, "username", None),
         getattr(reactor, "first_name", None),
         reactor_id,
@@ -441,7 +417,7 @@ async def reaction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_title = await _chat_title(
         chat_id, context, getattr(reaction.chat, "title", None)
     )
-    msg_repr = _msg_repr(getattr(reaction, "message", None), message_id)
+    msg_repr = msg_repr(getattr(reaction, "message", None), message_id)
 
     old_repr = ", ".join(sorted(old_emojis)) or "—"
     new_repr = ", ".join(sorted(new_emojis)) or "—"
@@ -738,7 +714,7 @@ async def _check_verify_reaction(update: Update,
         )
         logger.info(
             "verify trap (reaction): [%s] user=%s elapsed=%.3fs — кик",
-            chat_title, _user_repr(
+            chat_title, user_repr(
                 getattr(reactor, "username", None),
                 getattr(reactor, "first_name", None),
                 reactor.id,
@@ -764,7 +740,7 @@ async def _check_verify_reaction(update: Update,
     )
     logger.info(
         "Пользователь %s подтверждён в [%s] (за %.2fs, реакция)",
-        _user_repr(
+        user_repr(
             getattr(reactor, "username", None),
             getattr(reactor, "first_name", None),
             reactor.id,

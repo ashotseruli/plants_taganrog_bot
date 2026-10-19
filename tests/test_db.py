@@ -197,3 +197,20 @@ class TestTop:
 
     def test_empty(self, temp_db):
         assert db.db_get_top(5) == []
+        
+class TestGetUser:
+    def test_existing(self, temp_db):
+        db.db_upsert_user(1, "alice", "Alice")
+        row = db.db_get_user(1)
+        assert row is not None
+        assert row == (1, "alice", "Alice")
+
+    def test_missing(self, temp_db):
+        assert db.db_get_user(999) is None
+
+    def test_order_is_id_username_firstname(self, temp_db):
+        db.db_upsert_user(1, "alice", "Alice")
+        uid, username, first_name = db.db_get_user(1)
+        assert uid == 1
+        assert username == "alice"
+        assert first_name == "Alice"        

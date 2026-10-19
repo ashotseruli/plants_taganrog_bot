@@ -14,6 +14,8 @@ from utils import (
     safe_format,
     msg_edit_ts,
     trim_history,
+    user_repr,
+    msg_repr,
 )
 
 
@@ -187,3 +189,73 @@ class TestTrimHistory:
         out = trim_history(hist, max_msgs=10, max_chars=100)
         # одно сообщение больше лимита — оно отбрасывается целиком
         assert out == []
+        
+
+
+# ---------- user_repr ----------
+
+class TestUserRepr:
+    def test_username_and_name(self):
+        assert user_repr("vasya", "Василий", 123) == "@vasya (Василий)"
+
+    def test_username_only(self):
+        assert user_repr("vasya", None, 123) == "@vasya"
+
+    def test_name_only(self):
+        assert user_repr(None, "Василий", 123) == "(Василий)"
+
+    def test_nothing(self):
+        assert user_repr(None, None, 123) == "[123]"
+
+    def test_empty_strings(self):
+        # Пустые строки — ложные, значит идём в fallback [id]
+        assert user_repr("", "", 123) == "[123]"
+
+
+# ---------- msg_repr ----------
+
+class _MsgForRepr:
+    def __init__(self, text=None, caption=None):
+        if text is not None:
+            self.text = text
+        if caption is not None:
+            self.caption = caption
+
+
+class TestMsgRepr:
+    def test_text(self):
+        m = _MsgForRepr(text="продам монстеру")
+        assert msg_repr(m, 42) == 'msg=42 "продам монстеру"'
+
+    def test_caption(self):
+        m = _MsgForRepr(caption="подпись к фото")
+        assert msg_repr(m, 42) == 'msg=42 "подпись к фото"'
+
+    def test_text_preferred_over_caption(self):
+        # text идёт первым в getattr(text) or getattr(caption)
+        m = _MsgForRepr(text="текст", caption="подпись")
+        assert msg_repr(m, 42) == 'msg=42 "текст"'
+
+    def test_truncated_to_30_plus_ellipsis(self):
+        m = _MsgForRepr(text="x" * 100)
+        out = msg_repr(m, 42)
+        # "msg=42 \"...\"" + 30 символов + "…" + закрывающая кавычка
+        assert out.startswith('msg=42 "')
+        assert out.endswith('…"')
+        # Внутри превью 30 «x» + «…»
+        assert "x" * 30 + "…" in out
+
+    def test_newlines_replaced_with_space(self):
+        m = _MsgForRepr(text="первая\nвторая\nтретья")
+        assert msg_repr(m, 42) == 'msg=42 "первая вторая третья"'
+
+    def test_no_text(self):
+        m = _MsgForRepr()
+        assert msg_repr(m, 42) == "msg=42"
+
+    def test_none_obj(self):
+        assert msg_repr(None, 42) == "msg=42"
+
+    def test_message_id_in_output(self):
+        # ID всегда виден, даже без текста
+        assert "msg=999" in msg_repr(None, 999)

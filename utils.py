@@ -60,3 +60,25 @@ def trim_history(hist, max_msgs, max_chars):
         total += c
         result.append(item)
     return list(reversed(result))
+    
+def user_repr(username, first_name, user_id):
+    parts = []
+    if username:
+        parts.append(f"@{username}")
+    if first_name:
+        parts.append(f"({first_name})")
+    if parts:
+        return " ".join(parts)
+    return f"[{user_id}]"
+
+
+def msg_repr(msg_obj, message_id):
+    text = None
+    if msg_obj is not None:
+        text = getattr(msg_obj, "text", None) or getattr(msg_obj, "caption", None)
+    if text:
+        preview = text.replace("\n", " ").strip()
+        if len(preview) > 30:
+            preview = preview[:30] + "…"
+        return f'msg={message_id} "{preview}"'
+    return f"msg={message_id}"    
