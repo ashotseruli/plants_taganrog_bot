@@ -27,11 +27,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler,
-    CallbackQueryHandler, MessageReactionHandler
+    MessageReactionHandler
 )
 
 # Важно: .env должен быть загружен ДО импорта наших модулей,
@@ -128,7 +128,7 @@ pending_jobs = {}
 # (chat_id, user_id) -> {"sent_at": monotonic}
 pending_verify: dict = {}
 WAITING_FOR_NAMES = 1
-BOT_VERSION = "2.8.1"
+BOT_VERSION = "2.8.2"
 
 # --- Rate-limit на LLM: (chat_id, user_id) -> monotonic ts последнего запроса ---
 _llm_last_call: dict[tuple[int, int], float] = {}
@@ -154,6 +154,7 @@ OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 # --- Константы ---
 MAX_MESSAGE_AGE_SECONDS = CFG["new_member"]["max_message_age_seconds"]
 TRAP_WINDOW_SECONDS = CFG["new_member"]["trap_window_seconds"]
+VERIFY_REACTION = "👍"
 
 # Кулдаун на пользователя: из ENV, иначе из конфига, иначе 2.0.
 LLM_USER_COOLDOWN = float(
@@ -327,6 +328,11 @@ async def reaction_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      reaction.chat.id, reaction.message_id)
         return
     if reactor.is_bot:
+        return
+    # Проверка верификационных реакций — до всего остального.
+    # Если это реакция на сообщение верификации, обрабатываем отдельно
+    # и в карму не пускаем.
+    if await _check_verify_reaction(update, context):
         return
 
     chat_id = reaction.chat.id
@@ -588,83 +594,50 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #                  ВЕРИФИКАЦИЯ НОВЫХ УЧАСТНИКОВ
 # =========================================================
 
-def _verify_keyboard() -> InlineKeyboardMarkup:
-    """Одна большая кнопка «Подтвердить». В ряду она одна — занимает всю ширину."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Подтвердить", callback_data="verify:ok")
-    ]])
-
-
-def _verify_text(mention_html: str, kick_human: str,
-                 first_time: bool = True) -> str:
-    if first_time:
-        head = f"Привет, {mention_html}!"
-    else:
-        head = "⚠️ <b>Не та кнопка!</b>"
+def _verify_text(mention_html: str, kick_human: str) -> str:
     return (
-        f"{head} Нажми большую кнопку «✅ Подтвердить», чтобы доказать, "
+        f"👋 Привет, {mention_html}!\n\n"
+        f"Поставь реакцию {VERIFY_REACTION} на это сообщение, чтобы подтвердить, "
         f"что ты человек.\n"
-        f"Если не нажмёшь в течение {kick_human}, я удалю тебя из чата."
+        f"Если не успеешь за {kick_human} — удалю."
     )
 
+async def _check_verify_reaction(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обрабатывает реакцию на сообщение верификации.
 
-async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query is None or query.message is None:
-        return
+    Возвращает True, если реакция относилась к верификации (обработана или
+    намеренно проигнорирована). False — если это реакция на обычное сообщение,
+    и её надо пропустить в логику кармы.
+    """
+    reaction = update.message_reaction
+    chat_id = reaction.chat.id
+    message_id = reaction.message_id
+    reactor = reaction.user
 
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    key = (chat_id, user_id)
+    # Ищем активную верификацию по message_id в этом чате
+    key = None
+    info = None
+    for k, v in pending_verify.items():
+        if k[0] == chat_id and v.get("message_id") == message_id:
+            key = k
+            info = v
+            break
 
-    if query.data != "verify:ok":
-        await query.answer()
-        return
+    if key is None:
+        return False  # не верификационное сообщение
 
-    # Нет активной верификации (истекла или уже подтверждён)
-    if key not in pending_jobs or key not in pending_verify:
-        await query.answer("⏳ Время истекло или вы уже подтверждены.",
-                           show_alert=True)
-        return
+    # Чужая реакция — игнорируем
+    if reactor.id != key[1]:
+        return True
 
-    info = pending_verify[key]
+    new_emojis = extract_emojis(reaction.new_reaction)
+    if VERIFY_REACTION not in new_emojis:
+        return True  # не та реакция — молча ждём правильной
+
     elapsed = time.monotonic() - info.get("sent_at", 0.0)
 
-    # --- Trap: слишком быстро для человека ---
-    if elapsed < TRAP_WINDOW_SECONDS:
-        pending_verify.pop(key, None)
-        job = pending_jobs.pop(key, None)
-        if job is not None:
-            try:
-                job.schedule_removal()
-            except Exception:
-                pass
-
-        logger.info(
-            "verify trap: chat=%s user=%s elapsed=%.3fs — кик",
-            chat_id, user_id, elapsed,
-        )
-
-        try:
-            await query.answer("❌ Слишком быстро. Похоже, ты бот.",
-                               show_alert=True)
-        except Exception:
-            pass
-
-        try:
-            await query.edit_message_text("❌ Похоже, ты бот. Удалён.")
-        except Exception as e:
-            logger.error(f"trap edit failed: {e}")
-
-        try:
-            await context.bot.ban_chat_member(chat_id, user_id)
-            await context.bot.unban_chat_member(chat_id, user_id)
-            logger.info(f"trap: забанен и разбанен {user_id} в чате {chat_id}")
-        except Exception as e:
-            logger.error(f"trap ban/unban failed: {e}")
-        return
-
-    # --- Успех ---
+    # Забираем state независимо от исхода
     pending_verify.pop(key, None)
     job = pending_jobs.pop(key, None)
     if job is not None:
@@ -673,21 +646,42 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    await query.answer("✅ Подтверждено")
+    # --- Trap: слишком быстро для человека ---
+    if elapsed < TRAP_WINDOW_SECONDS:
+        logger.info(
+            "verify trap (reaction): chat=%s user=%s elapsed=%.3fs — кик",
+            chat_id, reactor.id, elapsed,
+        )
+        try:
+            await context.bot.ban_chat_member(chat_id, reactor.id)
+            await context.bot.unban_chat_member(chat_id, reactor.id)
+        except Exception as e:
+            logger.error(f"verify trap ban/unban failed: {e}")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text="❌ Похоже, ты бот. Удалён."
+            )
+        except Exception as e:
+            logger.error(f"verify trap edit failed: {e}")
+        return True
 
-    user = query.from_user
-    user_name = user.full_name or user.first_name or "No name"
-    user_username = user.username or "no_username"
+    # --- Успех ---
+    user_name = reactor.full_name or reactor.first_name or "No name"
+    user_username = reactor.username or "no_username"
     logger.info(
-        "Пользователь %s (@%s) [ID: %s] подтверждён в чате %s (за %.2fs)",
-        user_name, user_username, user_id, chat_id, elapsed,
+        "Пользователь %s (@%s) [ID: %s] подтверждён в чате %s "
+        "(за %.2fs, реакция)",
+        user_name, user_username, reactor.id, chat_id, elapsed,
     )
-
     try:
-        await query.edit_message_text("✅ Вы подтверждены! Добро пожаловать в чат.")
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text="✅ Вы подтверждены! Добро пожаловать в чат."
+        )
     except Exception as e:
-        logger.error(f"verify_callback edit failed: {e}")
-
+        logger.error(f"verify edit failed: {e}")
+    return True
 
 async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
@@ -746,15 +740,18 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             sent_msg = await update.message.reply_text(
                 _verify_text(new_member.mention_html(), kick_human),
-                reply_markup=_verify_keyboard(),
                 parse_mode='HTML'
             )
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
             continue
 
-        # Запоминаем момент отправки для trap-проверки в callback.
-        pending_verify[key] = {"sent_at": time.monotonic()}
+        # Запоминаем message_id и момент отправки: по ним найдём реакцию
+        # и посчитаем время до неё (trap-проверка).
+        pending_verify[key] = {
+            "sent_at": time.monotonic(),
+            "message_id": sent_msg.message_id,
+        }
 
         job = context.job_queue.run_once(
             remove_user,
@@ -1264,9 +1261,6 @@ def main():
     )
     application.add_handler(MessageReactionHandler(reaction_handler))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
-    application.add_handler(
-        CallbackQueryHandler(verify_callback, pattern=r"^verify:ok$")
-    )
 
     pair_handler = ConversationHandler(
         entry_points=[CommandHandler("pair", pair_start)],
